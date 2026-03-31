@@ -300,11 +300,7 @@ class CelestronAUX :
         AxisStatus m_AxisStatus[2] {STOPPED, STOPPED};
         AxisDirection m_AxisDirection[2] {FORWARD, FORWARD};
 
-        // Guiding offset in steps
-        // For each pulse, we modify the offset so that we can add it to our current tracking traget
-        double m_GuideOffset[2] = {0, 0};
-
-        // Remind which tracking mode & speed we have to restore after a GUIDING RATE_SHIFT update
+        // Tracking rates
         double m_TrackRates[2] = {TRACKRATE_SIDEREAL, 0};
         uint16_t m_TrackModes[2] = {AUX_SIDEREAL, AUX_STOP};
         TrackingWay m_TrackWay[2] = {BY_MODE, BY_MODE};
@@ -511,17 +507,8 @@ class CelestronAUX :
         static constexpr double STEPS_PER_HOUR {STEPS_PER_REVOLUTION / 24.0};
         static constexpr double HOURS_PER_STEP {24.0 / STEPS_PER_REVOLUTION};
 
-        // Measured rate that would result in 1 step/sec - only approximate
-        // static constexpr uint32_t GAIN_STEPS {80};
-        
-        // Rate based on geometric analysis and testing against SkySafari 7, simulator and real mount:
-        // Logical unit for guiding commands is 1/1024 arcsec/sec.
-        // Steps per arcsecond = 16777216 / (360 * 3600) = 16777216 / 1296000
-        // Scaling Factor (Units -> Steps/sec) = 1024 * (1296000 / 16777216)
-        // Factor = (1024 * 1296000) / 16777216  = 1327104000 / 16777216
-        // Simplified Rational Factor = 10125 / 128
-        // Steps/sec = Value * (10125 / 128) = Value * 79.1015625
-        static constexpr double GAIN_STEPS {10125.0 / 128};
+
+
 
         // MC_SET_POS_GUIDERATE & MC_SET_NEG_GUIDERATE use 24bit number rate in
         static constexpr uint8_t RATE_PER_ARCSEC {4};
