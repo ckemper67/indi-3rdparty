@@ -286,9 +286,7 @@ class CelestronAUX :
         AxisStatus m_AxisStatus[2] {STOPPED, STOPPED};
         AxisDirection m_AxisDirection[2] {FORWARD, FORWARD};
 
-        // Guiding offset in steps
-        // For each pulse, we modify the offset so that we can add it to our current tracking traget
-        double m_GuideOffset[2] = {0, 0};
+        // Tracking rates
         double m_TrackRates[2] = {TRACKRATE_SIDEREAL, 0};
 
         TelescopePierSide m_TargetPierSide {PIER_UNKNOWN};
@@ -482,8 +480,7 @@ class CelestronAUX :
         static constexpr double STEPS_PER_HOUR {STEPS_PER_REVOLUTION / 24.0};
         static constexpr double HOURS_PER_STEP {24.0 / STEPS_PER_REVOLUTION};
 
-        // Measured rate that would result in 1 step/sec
-        static constexpr uint32_t GAIN_STEPS {80};
+
 
         // MC_SET_POS_GUIDERATE & MC_SET_NEG_GUIDERATE use 24bit number rate in
         static constexpr uint8_t RATE_PER_ARCSEC {4};

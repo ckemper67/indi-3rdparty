@@ -1401,7 +1401,11 @@ bool CelestronAUX::guidePulse(INDI_EQ_AXIS axis, uint32_t ms, int8_t rate)
     else if (TrackState == SCOPE_TRACKING)
     {
         double arcsecs = TRACKRATE_SIDEREAL * ms / 1000.0 * rate / 100.;
-        m_GuideOffset[axis] += arcsecs / 3600;
+        if (axis == AXIS_RA)
+            // East Guiding (positive rate) decreases HA, which increases RA
+            m_SkyTrackingTarget.rightascension += (arcsecs / 3600.0 / 15.0);
+        else
+            m_SkyTrackingTarget.declination += (arcsecs / 3600.0);
     }
 
     return true;
@@ -1481,7 +1485,6 @@ void CelestronAUX::resetTracking()
     }
 
     m_TrackingElapsedTimer.restart();
-    m_GuideOffset[AXIS_AZ] = m_GuideOffset[AXIS_ALT] = 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////
@@ -1677,7 +1680,7 @@ bool CelestronAUX::Goto(double ra, double dec)
         if (TrackState != SCOPE_IDLE)
             Abort();
 
-        m_GuideOffset[AXIS_AZ] = m_GuideOffset[AXIS_ALT] = 0;
+
         m_SkyGOTOTarget.rightascension = ra;
         m_SkyGOTOTarget.declination = dec;
 
@@ -2081,15 +2084,15 @@ void CelestronAUX::TimerHit()
 
                 // Calculate expected tracking rates
                 double predRate[2] = {0, 0};
-                // Central difference, error quadratic in timestep
                 // Rates in deg/s
-                predRate[AXIS_AZ] = range180(AzimuthToDegrees(futureMountAxisCoordinates.azimuth - pastMountAxisCoordinates.azimuth)) /
-                                    timeStep / 2;
+                double futureAzD = AzimuthToDegrees(futureMountAxisCoordinates.azimuth);
+                double pastAzD = AzimuthToDegrees(pastMountAxisCoordinates.azimuth);
+                predRate[AXIS_AZ] = range180(futureAzD - pastAzD) / timeStep / 2;
                 predRate[AXIS_ALT] = (futureMountAxisCoordinates.altitude - pastMountAxisCoordinates.altitude) / timeStep / 2;
 
                 LOGF_DEBUG("Predicted positions (AZ):  %9.4f  %9.4f (now, future, degs)",
                            AzimuthToDegrees(targetMountAxisCoordinates.azimuth),
-                           AzimuthToDegrees(futureMountAxisCoordinates.azimuth)) ;
+                           futureAzD) ;
                 LOGF_DEBUG("Predicted positions (AL):  %9.4f  %9.4f (now, future, degs)", targetMountAxisCoordinates.altitude,
                            futureMountAxisCoordinates.altitude);
                 LOGF_DEBUG("Predicted Rates (AZ, ALT): %9.4f  %9.4f (arcsec/s)", 3600 * predRate[AXIS_AZ], 3600 * predRate[AXIS_ALT]);
@@ -2099,9 +2102,11 @@ void CelestronAUX::TimerHit()
                 predRate[AXIS_AZ] = 3600 * predRate[AXIS_AZ] * 1024;
                 predRate[AXIS_ALT] = 3600 * predRate[AXIS_ALT] * 1024;
 
-                // Now add the guiding offsets.
-                targetMountAxisCoordinates.azimuth += m_GuideOffset[AXIS_AZ];
-                targetMountAxisCoordinates.altitude += m_GuideOffset[AXIS_ALT];
+                // If we had guiding pulses active, mark them as complete
+                if (GuideWENP.getState() == IPS_BUSY)
+                    GuideComplete(AXIS_RA);
+                if (GuideNSNP.getState() == IPS_BUSY)
+                    GuideComplete(AXIS_DE);
 
                 // If we had guiding pulses active, mark them as complete
                 if (GuideWENP.getState() == IPS_BUSY)
@@ -2132,10 +2137,8 @@ void CelestronAUX::TimerHit()
                 {
                     if (m_az_pid_tuner && m_MountType == ALT_AZ) // Only for AltAz
                     {
-                        double current_az_encoder = EncoderNP[AXIS_AZ].getValue();
-                        // Use the target that includes guide offsets for the reference model input
-                        double target_az_for_model = DegreesToEncoders(AzimuthToDegrees(targetMountAxisCoordinates.azimuth));
-                        m_az_pid_tuner->processMeasurement(target_az_for_model, current_az_encoder);
+                        // Use the relative setpoint vs actual positional offset to tune robustly across Azimuth wrapping 
+                        m_az_pid_tuner->processMeasurement(0, -offsetSteps[AXIS_AZ]);
 
                         if (m_az_pid_tuner->isActivelyTuning())
                         {
@@ -2182,10 +2185,7 @@ void CelestronAUX::TimerHit()
                 {
                     if (m_al_pid_tuner && m_MountType == ALT_AZ) // Only for AltAz
                     {
-                        double current_al_encoder = EncoderNP[AXIS_ALT].getValue();
-                        // Use the target that includes guide offsets for the reference model input
-                        double target_al_for_model = DegreesToEncoders(targetMountAxisCoordinates.altitude);
-                        m_al_pid_tuner->processMeasurement(target_al_for_model, current_al_encoder);
+                        m_al_pid_tuner->processMeasurement(0, -offsetSteps[AXIS_ALT]);
 
                         if (m_al_pid_tuner->isActivelyTuning())
                         {
@@ -2906,7 +2906,6 @@ bool CelestronAUX::Abort()
     //    LOGF_INFO("*** Axis2 start: %.f finish: %.f steps/s: %.4f", m_TrackStartSteps[AXIS_ALT], EncoderNP[AXIS_ALT].getValue(), std::abs(EncoderNP[AXIS_ALT].getValue() - m_TrackStartSteps[AXIS_ALT]) / (ms/1000.));
     stopAxis(AXIS_AZ);
     stopAxis(AXIS_ALT);
-    m_GuideOffset[AXIS_AZ] = m_GuideOffset[AXIS_ALT] = 0;
     TrackState = SCOPE_IDLE;
 
     if (HorizontalCoordsNP.getState() != IPS_IDLE)
@@ -3010,9 +3009,9 @@ bool CelestronAUX::SetTrackRate(double raRate, double deRate)
     {
 
         double steps[2] = {0, 0};
-        // rate = (steps) * gain
-        steps[AXIS_AZ] = raRate * STEPS_PER_ARCSEC * GAIN_STEPS;
-        steps[AXIS_ALT] = deRate * STEPS_PER_ARCSEC * GAIN_STEPS;
+        // The rate passed here should be 1024 * angular rate in arsec/s.
+        steps[AXIS_AZ] = raRate * 1024;
+        steps[AXIS_ALT] = deRate * 1024;
         trackByRate(AXIS_AZ, steps[AXIS_AZ]);
         trackByRate(AXIS_ALT, steps[AXIS_ALT]);
     }
@@ -3041,9 +3040,9 @@ bool CelestronAUX::SetTrackMode(uint8_t mode)
         if (mode == TRACK_CUSTOM)
         {
             double steps[2] = {0, 0};
-            // rate = (steps) * gain
-            steps[AXIS_AZ] = m_TrackRates[AXIS_AZ] * STEPS_PER_ARCSEC * GAIN_STEPS;
-            steps[AXIS_ALT] = m_TrackRates[AXIS_ALT] * STEPS_PER_ARCSEC * GAIN_STEPS;
+            // The rate passed here should be 1024 * angular rate in arsec/s.
+            steps[AXIS_AZ] = m_TrackRates[AXIS_AZ] * 1024;
+            steps[AXIS_ALT] = m_TrackRates[AXIS_ALT] * 1024;
             trackByRate(AXIS_AZ, steps[AXIS_AZ]);
             trackByRate(AXIS_ALT, steps[AXIS_ALT]);
         }
