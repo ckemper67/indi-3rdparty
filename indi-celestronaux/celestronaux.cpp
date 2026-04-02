@@ -179,7 +179,7 @@ bool CelestronAUX::Handshake()
         // Initialize PID Tuners if in Alt-Az mode
         if (m_MountType == ALT_AZ)
         {
-            double dt = getPollingPeriod() / 1000.0;
+            double dt = UpdateRateNP[0].getValue() / 1000.0;
             // Default reference model: omega_n = 0.5 rad/s, zeta = 1.0 (critically damped)
             // These values might need tuning based on mount characteristics.
             double ref_omega_n = 0.5;
