@@ -19,6 +19,7 @@ class AdaptivePIDTuner
         void setAdaptationStepSizes(double stepKp, double stepKi, double stepKd);
         void setAdaptationAggressiveness(double aggressiveness); // General tuning parameter for step sizes
         void setHistorySize(size_t size); // How many samples to keep for analysis
+        void setDt(double dt); // Update sample time (seconds)
 
         void startActiveTuning();
         void stopActiveTuning();
