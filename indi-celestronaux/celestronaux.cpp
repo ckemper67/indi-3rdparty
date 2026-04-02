@@ -24,7 +24,6 @@
 
 #include <algorithm>
 #include <math.h>
-#include <queue>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
@@ -41,8 +40,6 @@
 
 using namespace INDI::AlignmentSubsystem;
 
-static constexpr double MIN_TRACK_RATE_FACTOR =
-    0.1; // Factor to ensure track rate doesn't go below a certain threshold of predicted rate
 
 static std::unique_ptr<CelestronAUX> telescope_caux(new CelestronAUX());
 
@@ -160,15 +157,17 @@ bool CelestronAUX::Handshake()
         }
         else
         {
-            LOG_ERROR("Got no response from target ALT or AZM.");
-            LOG_ERROR("Cannot continue without connection to motor controllers.");
+            LOG_ERROR("Failed to retrieve motor controller versions. Handshake failed.");
             return false;
         }
 
         LOG_DEBUG("Connection ready. Starting Processing.");
 
         // set mount type to alignment subsystem
-        //SetApproximateMountAlignmentFromMountType(static_cast<MountType>(MountTypeSP.findOnSwitchIndex()));
+        SetApproximateMountAlignmentFromMountType(
+            m_MountType == ALT_AZ ? INDI::AlignmentSubsystem::MathPluginManagement::ALTAZ :
+            INDI::AlignmentSubsystem::MathPluginManagement::EQUATORIAL);
+
         // tell the alignment math plugin to reinitialise
         Initialise(this);
 
@@ -183,7 +182,7 @@ bool CelestronAUX::Handshake()
         // Initialize PID Tuners if in Alt-Az mode
         if (m_MountType == ALT_AZ)
         {
-            double dt = getPollingPeriod() / 1000.0;
+            double dt = UpdateRateNP[0].getValue() / 1000.0;
             // Default reference model: omega_n = 0.5 rad/s, zeta = 1.0 (critically damped)
             // These values might need tuning based on mount characteristics.
             double ref_omega_n = 0.5;
@@ -278,14 +277,20 @@ bool CelestronAUX::initProperties()
     }
 
     if (m_MountType == ALT_AZ)
-        SetApproximateMountAlignment(ZENITH);
+    {
+        SetApproximateMountAlignmentFromMountType(INDI::AlignmentSubsystem::MathPluginManagement::ALTAZ);
+        SetParkDataType(PARK_AZ_ALT);
+    }
     else
-        SetApproximateMountAlignment(m_Location.latitude >= 0 ? NORTH_CELESTIAL_POLE : SOUTH_CELESTIAL_POLE);
+    {
+        SetApproximateMountAlignmentFromMountType(INDI::AlignmentSubsystem::MathPluginManagement::EQUATORIAL);
+        SetParkDataType(PARK_HA_DEC);
+    }
 
-    //    MountTypeSP[ALT_AZ].fill("ALTAZ", "AltAz", m_MountType == ALT_AZ ? ISS_ON : ISS_OFF);
-    //    MountTypeSP[EQ_FORK].fill("FORK", "EQ Fork", m_MountType == EQ_FORK ? ISS_ON : ISS_OFF);
-    //    MountTypeSP[EQ_GEM].fill("GEM", "EQ GEM", m_MountType == EQ_GEM ? ISS_ON : ISS_OFF);
-    //    MountTypeSP.fill(getDeviceName(), "MOUNT_TYPE", "Mount Type", MAIN_CONTROL_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+    MountTypeSP[ALT_AZ].fill("ALTAZ", "AltAz", m_MountType == ALT_AZ ? ISS_ON : ISS_OFF);
+    MountTypeSP[EQ_FORK].fill("FORK", "EQ Fork", m_MountType == EQ_FORK ? ISS_ON : ISS_OFF);
+    MountTypeSP[EQ_GEM].fill("GEM", "EQ GEM", m_MountType == EQ_GEM ? ISS_ON : ISS_OFF);
+    MountTypeSP.fill(getDeviceName(), "MOUNT_TYPE", "Mount Type", MAIN_CONTROL_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
 
     // Track Modes for Equatorial Mount
     if (m_MountType != ALT_AZ)
@@ -442,6 +447,14 @@ bool CelestronAUX::initProperties()
     AdaptiveTuningAlSP.fill(getDeviceName(), "ADAPTIVE_TUNING_AL", "Adaptive Tuning AL", MOUNTINFO_TAB, IP_RW, ISR_1OFMANY, 60,
                             IPS_IDLE);
     AdaptiveTuningAlSP.load();
+    
+    // Update Rate
+    UpdateRateNP[0].fill("UPDATE_RATE", "Tracking Update (ms)", "%.f", 100, 5000, 100, 1000);
+    UpdateRateNP.fill(getDeviceName(), "UPDATE_RATE", "Update Rate", MOUNTINFO_TAB, IP_RW, 60, IPS_IDLE);
+    UpdateRateNP.load();
+
+    // Set default polling period to 1Hz
+    SetTimer(UpdateRateNP[0].getValue());
 
     // Firmware Info
     FirmwareTP[FW_MODEL].fill("Model", "", nullptr);
@@ -454,6 +467,11 @@ bool CelestronAUX::initProperties()
     FirmwareTP[FW_BAT].fill("Battery version", "", nullptr);
     FirmwareTP[FW_GPS].fill("GPS version", "", nullptr);
     FirmwareTP.fill(getDeviceName(), "Firmware Info", "Firmware Info", MOUNTINFO_TAB, IP_RO, 0, IPS_IDLE);
+
+    // EQUATORIAL_PE
+    EqPENP[PE_RA].fill("RA", "RA H:M:S", "%10.6m", 0, 24, 0, 0);
+    EqPENP[PE_DEC].fill("DEC", "DEC D:M:S", "%10.6m", -90, 90, 0, 0);
+    EqPENP.fill(getDeviceName(), "EQUATORIAL_PE", "Pointing RA/Dec", MAIN_CONTROL_TAB, IP_RO, 0, IPS_IDLE);
 
     /////////////////////////////////////////////////////////////////////////////////////
     /// Initial Configuration
@@ -553,7 +571,7 @@ bool CelestronAUX::updateProperties()
     if (isConnected())
     {
         // Main Control Panel
-        //defineProperty(MountTypeSP);
+        defineProperty(MountTypeSP);
         //defineProperty(GainNP);
         if (m_MountType == ALT_AZ)
             defineProperty(HorizontalCoordsNP);
@@ -589,15 +607,20 @@ bool CelestronAUX::updateProperties()
         defineProperty(GPSEmuSP);
         defineProperty(ApproachDirectionSP);
 
+        defineProperty(EqPENP);
+
         // Encoders
         defineProperty(EncoderNP);
         defineProperty(AngleNP);
+        // Always define these properties if we're in a simulator mode or if we want to allow runtime switching
+        defineProperty(Axis1PIDNP);
+        defineProperty(Axis2PIDNP);
+        defineProperty(AdaptiveTuningAzSP);
+        defineProperty(AdaptiveTuningAlSP);
+        defineProperty(UpdateRateNP);
         if (m_MountType == ALT_AZ)
         {
-            defineProperty(Axis1PIDNP);
-            defineProperty(Axis2PIDNP);
-            defineProperty(AdaptiveTuningAzSP);
-            defineProperty(AdaptiveTuningAlSP);
+            defineProperty(HorizontalCoordsNP);
         }
 
         getModel(AZM);
@@ -780,7 +803,7 @@ bool CelestronAUX::saveConfigItems(FILE *fp)
     INDI::Telescope::saveConfigItems(fp);
     SaveAlignmentConfigProperties(fp);
 
-    //MountTypeSP.save(fp);
+    MountTypeSP.save(fp);
     PortTypeSP.save(fp);
     CordWrapToggleSP.save(fp);
     CordWrapPositionSP.save(fp);
@@ -875,6 +898,35 @@ bool CelestronAUX::ISNewNumber(const char *dev, const char *name, double values[
             return true;
         }
 
+        if (UpdateRateNP.isNameMatch(name))
+        {
+            UpdateRateNP.update(values, names, n);
+            double newDt = UpdateRateNP[0].getValue() / 1000.0;
+            if (m_az_pid_tuner) m_az_pid_tuner->setDt(newDt);
+            if (m_al_pid_tuner) m_al_pid_tuner->setDt(newDt);
+
+            // Re-initialize PID controllers with new dt
+            {
+                double kp, ki, kd;
+                kp = Axis1PIDNP[Propotional].getValue();
+                ki = Axis1PIDNP[Integral].getValue();
+                kd = Axis1PIDNP[Derivative].getValue();
+                m_Controllers[AXIS_AZ].reset(new PID(newDt, 10000, -10000, kp, ki, kd));
+                m_Controllers[AXIS_AZ]->setIntegratorLimits(-10000, 10000);
+
+                kp = Axis2PIDNP[Propotional].getValue();
+                ki = Axis2PIDNP[Integral].getValue();
+                kd = Axis2PIDNP[Derivative].getValue();
+                m_Controllers[AXIS_ALT].reset(new PID(newDt, 10000, -10000, kp, ki, kd));
+                m_Controllers[AXIS_ALT]->setIntegratorLimits(-10000, 10000);
+            }
+
+            SetTimer(UpdateRateNP[0].getValue());
+            UpdateRateNP.setState(IPS_OK);
+            UpdateRateNP.apply();
+            return true;
+        }
+
         // Horizontal Coords
         if (HorizontalCoordsNP.isNameMatch(name))
         {
@@ -961,27 +1013,32 @@ bool CelestronAUX::ISNewSwitch(const char *dev, const char *name, ISState *state
     if (strcmp(dev, getDeviceName()) == 0)
     {
         // mount type
-        //        if (MountTypeSP.isNameMatch(name))
-        //        {
-        //            // Get current type
-        //            MountType currentMountType = static_cast<MountType>(MountTypeSP.findOnSwitchIndex());
+        if (MountTypeSP.isNameMatch(name))
+        {
+            // Get current type
+            MountType currentMountType = m_MountType;
 
-        //            MountTypeSP.update(states, names, n);
-        //            MountTypeSP.setState(IPS_OK);
-        //            MountTypeSP.apply();
+            MountTypeSP.update(states, names, n);
+            MountTypeSP.setState(IPS_OK);
+            MountTypeSP.apply();
 
-        //            // Get target type
-        //            MountType targetMountType = static_cast<MountType>(MountTypeSP.findOnSwitchIndex());
+            // Get target type
+            m_MountType = static_cast<MountType>(MountTypeSP.findOnSwitchIndex());
 
-        //            // If different then update
-        //            if (currentMountType != targetMountType)
-        //            {
-        //                LOG_INFO("Mount type updated. You must restart the driver for changes to take effect.");
-        //                saveConfig(true, MountTypeSP.getName());
-        //            }
+            // If different then update
+            if (currentMountType != m_MountType)
+            {
+                LOG_INFO("Mount type updated.");
+                SetApproximateMountAlignmentFromMountType(
+                    m_MountType == ALT_AZ ? INDI::AlignmentSubsystem::MathPluginManagement::ALTAZ :
+                    INDI::AlignmentSubsystem::MathPluginManagement::EQUATORIAL);
+                SetParkDataType(m_MountType == ALT_AZ ? PARK_AZ_ALT : PARK_HA_DEC);
+                Initialise(this);
+                saveConfig(MountTypeSP);
+            }
 
-        //            return true;
-        //        }
+            return true;
+        }
 
         // Approach Direction
         if (ApproachDirectionSP.isNameMatch(name))
@@ -1167,6 +1224,10 @@ bool CelestronAUX::ISNewSwitch(const char *dev, const char *name, ISState *state
 
         // Process alignment properties
         ProcessAlignmentSwitchProperties(this, name, states, names, n);
+
+        if (strcmp(name, "ALIGNMENT_SUBSYSTEM_MATH_PLUGINS") == 0 ||
+            strcmp(name, "ALIGNMENT_SUBSYSTEM_ACTIVE") == 0)
+            saveConfig();
 
         // Process Focus Properties
         if (strstr(name, "FOCUS_"))
@@ -1355,6 +1416,11 @@ bool CelestronAUX::MoveWE(INDI_DIR_WE dir, TelescopeMotionCommand command)
 /////////////////////////////////////////////////////////////////////////////////////
 IPState CelestronAUX::GuideNorth(uint32_t ms)
 {
+    if (m_MountType == ALT_AZ)
+    {
+        guideAltAzDecomposed(GuideRateNP[AXIS_ALT].getValue(), 0.0, ms);
+        return IPS_BUSY;
+    }
     int8_t rate = static_cast<int8_t>(GuideRateNP[AXIS_ALT].getValue() * 100);
     guidePulse(AXIS_DE, ms, rate);
     return IPS_BUSY;
@@ -1362,6 +1428,11 @@ IPState CelestronAUX::GuideNorth(uint32_t ms)
 
 IPState CelestronAUX::GuideSouth(uint32_t ms)
 {
+    if (m_MountType == ALT_AZ)
+    {
+        guideAltAzDecomposed(-GuideRateNP[AXIS_ALT].getValue(), 0.0, ms);
+        return IPS_BUSY;
+    }
     int8_t rate = static_cast<int8_t>(GuideRateNP[AXIS_ALT].getValue() * 100);
     guidePulse(AXIS_DE, ms, -rate);
     return IPS_BUSY;
@@ -1369,6 +1440,11 @@ IPState CelestronAUX::GuideSouth(uint32_t ms)
 
 IPState CelestronAUX::GuideEast(uint32_t ms)
 {
+    if (m_MountType == ALT_AZ)
+    {
+        guideAltAzDecomposed(0.0, -GuideRateNP[AXIS_AZ].getValue(), ms);
+        return IPS_BUSY;
+    }
     int8_t rate = static_cast<int8_t>(GuideRateNP[AXIS_AZ].getValue() * 100);
     guidePulse(AXIS_RA, ms, -rate);
     return IPS_BUSY;
@@ -1376,6 +1452,11 @@ IPState CelestronAUX::GuideEast(uint32_t ms)
 
 IPState CelestronAUX::GuideWest(uint32_t ms)
 {
+    if (m_MountType == ALT_AZ)
+    {
+        guideAltAzDecomposed(0.0, GuideRateNP[AXIS_AZ].getValue(), ms);
+        return IPS_BUSY;
+    }
     int8_t rate = static_cast<int8_t>(GuideRateNP[AXIS_AZ].getValue() * 100);
     guidePulse(AXIS_RA, ms, rate);
     return IPS_BUSY;
@@ -1384,6 +1465,7 @@ IPState CelestronAUX::GuideWest(uint32_t ms)
 bool CelestronAUX::guidePulse(INDI_EQ_AXIS axis, uint32_t ms, int8_t rate)
 {
     // For Equatorial mounts, use regular guiding.
+    // Also use regular guiding for Alt-Az if we're not in tracking state (unlikely)
     if (m_MountType != ALT_AZ)
     {
         uint8_t ticks = std::min(255u, ms / 10);
@@ -1409,6 +1491,20 @@ bool CelestronAUX::guidePulse(INDI_EQ_AXIS axis, uint32_t ms, int8_t rate)
     }
 
     return true;
+}
+
+bool CelestronAUX::guidePulsePhysical(INDI_EQ_AXIS axis, uint32_t ms, int8_t rate)
+{
+    uint8_t ticks = std::min(255u, ms / 10);
+    AUXBuffer data(2);
+    data[0] = rate;
+    data[1] = ticks;
+    AUXCommand cmd(MC_AUX_GUIDE, APP, axis == AXIS_DE ? ALT : AZM, data);
+    if (axis == AXIS_DE)
+        m_GuideDETimer.start(ticks * 10);
+    else
+        m_GuideRATimer.start(ticks * 10);
+    return sendAUXCommand(cmd);
 }
 /////////////////////////////////////////////////////////////////////////////////////
 ///
@@ -1462,12 +1558,15 @@ void CelestronAUX::resetTracking()
     //    m_TrackStartSteps[AXIS_AZ] = EncoderNP[AXIS_AZ].getValue();
     //    m_TrackStartSteps[AXIS_ALT] = EncoderNP[AXIS_ALT].getValue();
 
-    m_Controllers[AXIS_AZ].reset(new PID(getPollingPeriod() / 1000.0, 10000, -10000, Axis1PIDNP[Propotional].getValue(),
+    double dt = UpdateRateNP[0].getValue() / 1000.0;
+    m_Controllers[AXIS_AZ].reset(new PID(dt, 10000, -10000, Axis1PIDNP[Propotional].getValue(),
                                          Axis1PIDNP[Derivative].getValue(), Axis1PIDNP[Integral].getValue()));
     m_Controllers[AXIS_AZ]->setIntegratorLimits(-10000, 10000);
-    m_Controllers[AXIS_ALT].reset(new PID(getPollingPeriod() / 1000.0, 10000, -10000, Axis2PIDNP[Propotional].getValue(),
+    m_Controllers[AXIS_ALT].reset(new PID(dt, 10000, -10000, Axis2PIDNP[Propotional].getValue(),
                                           Axis2PIDNP[Derivative].getValue(), Axis2PIDNP[Integral].getValue()));
     m_Controllers[AXIS_ALT]->setIntegratorLimits(-10000, 10000);
+
+    m_IsPipelinePrimed = false;
 
     if (m_az_pid_tuner)
     {
@@ -1933,6 +2032,10 @@ bool CelestronAUX::mountToSkyCoords()
         }
     }
 
+    EqPENP[PE_RA].setValue(RightAscension);
+    EqPENP[PE_DEC].setValue(Declination);
+    EqPENP.apply();
+
     m_SkyCurrentRADE.rightascension = RightAscension;
     m_SkyCurrentRADE.declination = Declination;
     return true;
@@ -2044,189 +2147,138 @@ void CelestronAUX::TimerHit()
             }
             // We only engage ACTIVE tracking if the mount is Alt-Az.
             // For Equatorial mount, we simply use user-selected tracking mode and let it passively track.
+            // We only engage ACTIVE tracking if the mount is Alt-Az.
+            // For Equatorial mount, we simply use user-selected tracking mode and let it passively track.
             else if (m_MountType == ALT_AZ)
             {
-                TelescopeDirectionVector TDV;
-                TelescopeDirectionVector futureTDV;
-                TelescopeDirectionVector pastTDV;
-                INDI::IHorizontalCoordinates targetMountAxisCoordinates { 0, 0 };
-                INDI::IHorizontalCoordinates pastMountAxisCoordinates { 0, 0 };
-                INDI::IHorizontalCoordinates futureMountAxisCoordinates { 0, 0 };
-                double timeStep { 5.0 }; // time step for tracking rate estimation in seconds
-                double JDoffset { timeStep / (60 * 60 * 24) } ; // The same in days
+                double dt       = UpdateRateNP[0].getValue() / 1000.0;
+                double JDnow    = ln_get_julian_from_sys();
+                double JDoffset = dt / (60 * 60 * 24); // dt seconds in days
 
-                // Start by transforming tracking target celestial coordinates to telescope coordinates.
-                if (TransformCelestialToTelescope(m_SkyTrackingTarget.rightascension, m_SkyTrackingTarget.declination,
-                                                  0, TDV))
+                auto getCoords = [&](double JD, INDI::IHorizontalCoordinates & coords)
                 {
-                    // If mount is Alt-Az then that's all we need to do
-                    AltitudeAzimuthFromTelescopeDirectionVector(TDV, targetMountAxisCoordinates);
-                    TransformCelestialToTelescope(m_SkyTrackingTarget.rightascension, m_SkyTrackingTarget.declination,
-                                                  JDoffset, futureTDV);
-                    AltitudeAzimuthFromTelescopeDirectionVector(futureTDV, futureMountAxisCoordinates);
-                    TransformCelestialToTelescope(m_SkyTrackingTarget.rightascension, m_SkyTrackingTarget.declination,
-                                                  -JDoffset, pastTDV);
-                    AltitudeAzimuthFromTelescopeDirectionVector(pastTDV, pastMountAxisCoordinates);
+                    LOG_INFO("Transforming celestial to telescope coordinates...");
+                    TelescopeDirectionVector TDV;
+                    if (!TransformCelestialToTelescope(m_SkyTrackingTarget.rightascension, m_SkyTrackingTarget.declination, JD - JDnow, TDV))
+                    {
+                        INDI::IEquatorialCoordinates Equat = { m_SkyTrackingTarget.rightascension, m_SkyTrackingTarget.declination };
+                        INDI::EquatorialToHorizontal(&Equat, &m_Location, JD, &coords);
+                    }
+                    else
+                    {
+                        AltitudeAzimuthFromTelescopeDirectionVector(TDV, coords);
+                    }
+                };
 
+                // Invalidation Check: Prime the pipeline if needed
+                if (!m_IsPipelinePrimed || 
+                    std::abs(m_LastTrackingTarget.rightascension - m_SkyTrackingTarget.rightascension) > 1e-6 ||
+                    std::abs(m_LastTrackingTarget.declination - m_SkyTrackingTarget.declination) > 1e-6 ||
+                    std::abs(m_LastTrackingDt - dt) > 1e-6)
+                {
+                    getCoords(JDnow - JDoffset, m_TrackingWindowCoords[0]);
+                    getCoords(JDnow, m_TrackingWindowCoords[1]);
+                    getCoords(JDnow + JDoffset, m_TrackingWindowCoords[2]);
+                    
+                    m_IsPipelinePrimed = true;
+                    m_LastTrackingTarget = m_SkyTrackingTarget;
+                    m_LastTrackingDt = dt;
+                    LOG_DEBUG("Tracking pipeline primed with 3 points.");
                 }
-                // If transformation failed.
                 else
                 {
-                    double JDnow {ln_get_julian_from_sys()};
-                    INDI::IEquatorialCoordinates EquatorialCoordinates { 0, 0 };
-                    EquatorialCoordinates.rightascension  = m_SkyTrackingTarget.rightascension;
-                    EquatorialCoordinates.declination = m_SkyTrackingTarget.declination;
-                    INDI::EquatorialToHorizontal(&EquatorialCoordinates, &m_Location, JDnow, &targetMountAxisCoordinates);
-                    INDI::EquatorialToHorizontal(&EquatorialCoordinates, &m_Location, JDnow + JDoffset, &futureMountAxisCoordinates);
-                    INDI::EquatorialToHorizontal(&EquatorialCoordinates, &m_Location, JDnow - JDoffset, &pastMountAxisCoordinates);
+                    // Sliding Window Update: Only 1 new call per tick
+                    m_TrackingWindowCoords[0] = m_TrackingWindowCoords[1];
+                    m_TrackingWindowCoords[1] = m_TrackingWindowCoords[2];
+                    getCoords(JDnow + JDoffset, m_TrackingWindowCoords[2]);
                 }
 
+                // 2. Parabolic coefficients: P(t) = at^2 + bt + c, where t=0 is JDnow
+                // t is in units of dt. Points are at t=-1, t=0, t=1
+                double pAz[3] = { AzimuthToDegrees(m_TrackingWindowCoords[0].azimuth),
+                                  AzimuthToDegrees(m_TrackingWindowCoords[1].azimuth),
+                                  AzimuthToDegrees(m_TrackingWindowCoords[2].azimuth) };
+                double pAlt[3] = { m_TrackingWindowCoords[0].altitude, 
+                                   m_TrackingWindowCoords[1].altitude, 
+                                   m_TrackingWindowCoords[2].altitude };
 
-                // Calculate expected tracking rates
-                double predRate[2] = {0, 0};
-                // Rates in deg/s
-                double futureAzD = AzimuthToDegrees(futureMountAxisCoordinates.azimuth);
-                double pastAzD = AzimuthToDegrees(pastMountAxisCoordinates.azimuth);
-                predRate[AXIS_AZ] = range180(futureAzD - pastAzD) / timeStep / 2;
-                predRate[AXIS_ALT] = (futureMountAxisCoordinates.altitude - pastMountAxisCoordinates.altitude) / timeStep / 2;
+                // Azimuth wrapping handling for interpolation
+                pAz[0] = pAz[1] + range180(pAz[0] - pAz[1]);
+                pAz[2] = pAz[1] + range180(pAz[2] - pAz[1]);
 
-                LOGF_DEBUG("Predicted positions (AZ):  %9.4f  %9.4f (now, future, degs)",
-                           AzimuthToDegrees(targetMountAxisCoordinates.azimuth),
-                           futureAzD) ;
-                LOGF_DEBUG("Predicted positions (AL):  %9.4f  %9.4f (now, future, degs)", targetMountAxisCoordinates.altitude,
-                           futureMountAxisCoordinates.altitude);
-                LOGF_DEBUG("Predicted Rates (AZ, ALT): %9.4f  %9.4f (arcsec/s)", 3600 * predRate[AXIS_AZ], 3600 * predRate[AXIS_ALT]);
+                // coefficients for Azimuth: a = (P1 + P(-1) - 2P0)/2, b = (P1 - P(-1))/2, c = P0
+                double az_a = (pAz[2] + pAz[0] - 2 * pAz[1]) / 2.0;
+                double az_b = (pAz[2] - pAz[0]) / 2.0;
 
-                // Rates in units 1024 * arcsec/s
-                // This is specific to Celestron AUX protocol
-                predRate[AXIS_AZ] = 3600 * predRate[AXIS_AZ] * 1024;
-                predRate[AXIS_ALT] = 3600 * predRate[AXIS_ALT] * 1024;
+                // coefficients for Altitude
+                double alt_a = (pAlt[2] + pAlt[0] - 2 * pAlt[1]) / 2.0;
+                double alt_b = (pAlt[2] - pAlt[0]) / 2.0;
 
-                // If we had guiding pulses active, mark them as complete
-                if (GuideWENP.getState() == IPS_BUSY)
-                    GuideComplete(AXIS_RA);
-                if (GuideNSNP.getState() == IPS_BUSY)
-                    GuideComplete(AXIS_DE);
+                // 3. Predicted Target Position at the end of the next interval (T + dt)
+                double targetAzNext = az_a * dt * dt + az_b * dt + pAz[1];
+                double targetAltNext = alt_a * dt * dt + alt_b * dt + pAlt[1];
 
-                // If we had guiding pulses active, mark them as complete
-                if (GuideWENP.getState() == IPS_BUSY)
-                    GuideComplete(AXIS_RA);
-                if (GuideNSNP.getState() == IPS_BUSY)
-                    GuideComplete(AXIS_DE);
+                // 4. Current ground truth from encoders
+                double currentAz = EncodersToDegrees(EncoderNP[AXIS_AZ].getValue());
+                double currentAlt = EncodersToDegrees(EncoderNP[AXIS_ALT].getValue());
 
-                // Next get current alt-az
-                INDI::IHorizontalCoordinates currentAltAz { 0, 0 };
-                currentAltAz.azimuth = DegreesToAzimuth(EncodersToDegrees(EncoderNP[AXIS_AZ].getValue()));
-                currentAltAz.altitude = EncodersToDegrees(EncoderNP[AXIS_ALT].getValue());
+                // 5. Predictive Positioning steering velocities (degrees/sec)
+                // This velocity closes the entire gap to the next mathematical target in exactly dt seconds.
+                double vSteerAz = range180(targetAzNext - currentAz) / dt;
+                double vSteerAlt = (targetAltNext - currentAlt) / dt;
 
-                // Offset in degrees
-                double offsetAngle[2] = {0, 0};
-                offsetAngle[AXIS_AZ] = range180(targetMountAxisCoordinates.azimuth - currentAltAz.azimuth);
-                offsetAngle[AXIS_ALT] = (targetMountAxisCoordinates.altitude - currentAltAz.altitude);
+                // 6. Convert to Celestron units (1024 * arcsec/s)
+                double trackRates[2];
+                trackRates[AXIS_AZ] = vSteerAz * 3600.0 * 1024.0;
+                trackRates[AXIS_ALT] = vSteerAlt * 3600.0 * 1024.0;
 
-                int32_t offsetSteps[2] = {0, 0};
-                int32_t targetSteps[2] = {0, 0};
-                double trackRates[2] = {0, 0};
+                // 7. Adaptive PID Tuning & Servo Feedback
+                // The steering velocity already acts as a Proportional controller (Kp = 1/dt).
+                // We use the Adaptive PID tuner to "mop up" any secondary oscillations or model residuals.
+                double offsetSteps[2];
+                offsetSteps[AXIS_AZ] = range180(pAz[1] - currentAz) * STEPS_PER_DEGREE;
+                offsetSteps[AXIS_ALT] = (pAlt[1] - currentAlt) * STEPS_PER_DEGREE;
 
-                offsetSteps[AXIS_AZ] = offsetAngle[AXIS_AZ] * STEPS_PER_DEGREE;
-                offsetSteps[AXIS_ALT] = offsetAngle[AXIS_ALT] * STEPS_PER_DEGREE;
-
-                // Only apply tracking IF we're still on the same side of the curve
-                // If we switch over, let's settle for a bit
-                /// AZ tracking
+                // Update Tuners & Apply PID correction ONLY if Enabled
+                if (m_az_pid_tuner && m_MountType == ALT_AZ && AdaptiveTuningAzSP[INDI_ENABLED].s == ISS_ON)
                 {
-                    if (m_az_pid_tuner && m_MountType == ALT_AZ) // Only for AltAz
+                    m_az_pid_tuner->processMeasurement(0, -offsetSteps[AXIS_AZ]);
+                    if (m_az_pid_tuner->isActivelyTuning())
                     {
-                        // Use the relative setpoint vs actual positional offset to tune robustly across Azimuth wrapping 
-                        m_az_pid_tuner->processMeasurement(0, -offsetSteps[AXIS_AZ]);
-
-                        if (m_az_pid_tuner->isActivelyTuning())
-                        {
-                            double newKp, newKi, newKd;
-                            m_az_pid_tuner->getAdaptedGains(newKp, newKi, newKd);
-                            m_Controllers[AXIS_AZ]->setKp(newKp);
-                            m_Controllers[AXIS_AZ]->setKi(newKi);
-                            m_Controllers[AXIS_AZ]->setKd(newKd);
-                            // Optionally update Axis1PIDNP if you want to see live values in client
-                            // Axis1PIDNP[Propotional].setValue(newKp);
-                            // Axis1PIDNP[Integral].setValue(newKi);
-                            // Axis1PIDNP[Derivative].setValue(newKd);
-                            // defineProperty(Axis1PIDNP); // Be careful with frequent updates
-                        }
+                        double newKp, newKi, newKd;
+                        m_az_pid_tuner->getAdaptedGains(newKp, newKi, newKd);
+                        m_Controllers[AXIS_AZ]->setKp(newKp);
+                        m_Controllers[AXIS_AZ]->setKi(newKi);
+                        m_Controllers[AXIS_AZ]->setKd(newKd);
                     }
-
-                    m_OffsetSwitchSettle[AXIS_AZ] = 0; // Reset settle counter as in Skywatcher
-                    m_LastOffset[AXIS_AZ] = offsetSteps[AXIS_AZ];
-                    targetSteps[AXIS_AZ] = DegreesToEncoders(AzimuthToDegrees(targetMountAxisCoordinates.azimuth));
-                    // Track rate: predicted + PID controlled correction based on tracking error: offsetSteps
-                    trackRates[AXIS_AZ] = predRate[AXIS_AZ] + m_Controllers[AXIS_AZ]->calculate(0, -offsetSteps[AXIS_AZ]);
-
-                    // Apply minTrackRate logic from Skywatcher
-                    double minAzTrackRate = predRate[AXIS_AZ] * MIN_TRACK_RATE_FACTOR;
-                    if (trackRates[AXIS_AZ] * predRate[AXIS_AZ] < 0 || std::abs(trackRates[AXIS_AZ]) < std::abs(minAzTrackRate))
-                        trackRates[AXIS_AZ] = minAzTrackRate;
-
-                    LOGF_DEBUG("Predicted AZ Rate: %8.2f", predRate[AXIS_AZ]);
-                    LOGF_DEBUG("Tracking AZ Now: %8.f Target: %8d Offset: %8d Rate: %8.2f", EncoderNP[AXIS_AZ].getValue(), targetSteps[AXIS_AZ],
-                               offsetSteps[AXIS_AZ], trackRates[AXIS_AZ]);
-#ifdef DEBUG_PID
-                    LOGF_DEBUG("Tracking AZ P: %8.1f I: %8.1f D: %8.1f O: %8.1f",
-                               m_Controllers[AXIS_AZ]->proportionalTerm(),
-                               m_Controllers[AXIS_AZ]->integralTerm(),
-                               m_Controllers[AXIS_AZ]->derivativeTerm(),
-                               trackRates[AXIS_AZ] - predRate[AXIS_AZ]);
-#endif
-
-                    // Set the tracking rate
-                    trackByRate(AXIS_AZ, static_cast<int32_t>(trackRates[AXIS_AZ]));
+                    trackRates[AXIS_AZ] += m_Controllers[AXIS_AZ]->calculate(0, -offsetSteps[AXIS_AZ]);
                 }
-
-                /// Alt tracking
+                if (m_al_pid_tuner && m_MountType == ALT_AZ && AdaptiveTuningAlSP[INDI_ENABLED].s == ISS_ON)
                 {
-                    if (m_al_pid_tuner && m_MountType == ALT_AZ) // Only for AltAz
+                    m_al_pid_tuner->processMeasurement(0, -offsetSteps[AXIS_ALT]);
+                    if (m_al_pid_tuner->isActivelyTuning())
                     {
-                        m_al_pid_tuner->processMeasurement(0, -offsetSteps[AXIS_ALT]);
-
-                        if (m_al_pid_tuner->isActivelyTuning())
-                        {
-                            double newKp, newKi, newKd;
-                            m_al_pid_tuner->getAdaptedGains(newKp, newKi, newKd);
-                            m_Controllers[AXIS_ALT]->setKp(newKp);
-                            m_Controllers[AXIS_ALT]->setKi(newKi);
-                            m_Controllers[AXIS_ALT]->setKd(newKd);
-                            // Axis2PIDNP[Propotional].setValue(newKp);
-                            // Axis2PIDNP[Integral].setValue(newKi);
-                            // Axis2PIDNP[Derivative].setValue(newKd);
-                            // defineProperty(Axis2PIDNP);
-                        }
+                        double newKp, newKi, newKd;
+                        m_al_pid_tuner->getAdaptedGains(newKp, newKi, newKd);
+                        m_Controllers[AXIS_ALT]->setKp(newKp);
+                        m_Controllers[AXIS_ALT]->setKi(newKi);
+                        m_Controllers[AXIS_ALT]->setKd(newKd);
                     }
-
-                    m_OffsetSwitchSettle[AXIS_ALT] = 0; // Reset settle counter as in Skywatcher
-                    m_LastOffset[AXIS_ALT] = offsetSteps[AXIS_ALT];
-                    targetSteps[AXIS_ALT]  = DegreesToEncoders(targetMountAxisCoordinates.altitude);
-                    // Track rate: predicted + PID controlled correction based on tracking error: offsetSteps
-                    trackRates[AXIS_ALT] = predRate[AXIS_ALT] + m_Controllers[AXIS_ALT]->calculate(0, -offsetSteps[AXIS_ALT]);
-
-                    // Apply minTrackRate logic from Skywatcher
-                    double minAlTrackRate = predRate[AXIS_ALT] * MIN_TRACK_RATE_FACTOR;
-                    if (trackRates[AXIS_ALT] * predRate[AXIS_ALT] < 0 || std::abs(trackRates[AXIS_ALT]) < std::abs(minAlTrackRate))
-                        trackRates[AXIS_ALT] = minAlTrackRate;
-
-                    LOGF_DEBUG("Predicted AL Rate: %8.2f", predRate[AXIS_ALT]);
-                    LOGF_DEBUG("Tracking AL Now: %8.f Target: %8d Offset: %8d Rate: %8.2f", EncoderNP[AXIS_ALT].getValue(),
-                               targetSteps[AXIS_ALT],
-                               offsetSteps[AXIS_ALT], trackRates[AXIS_ALT]);
-#ifdef DEBUG_PID
-                    LOGF_DEBUG("Tracking AL P: %8.1f I: %8.1f D: %8.1f O: %8.1f",
-                               m_Controllers[AXIS_ALT]->proportionalTerm(),
-                               m_Controllers[AXIS_ALT]->integralTerm(),
-                               m_Controllers[AXIS_ALT]->derivativeTerm(),
-                               trackRates[AXIS_ALT] - predRate[AXIS_ALT]);
-#endif
-                    trackByRate(AXIS_ALT, static_cast<int32_t>(trackRates[AXIS_ALT]));
+                    trackRates[AXIS_ALT] += m_Controllers[AXIS_ALT]->calculate(0, -offsetSteps[AXIS_ALT]);
                 }
+
+                LOGF_DEBUG("Predictive Steering - AZ Rate: %8.2f (arcsec/s) Alt Rate: %8.2f (arcsec/s)", 
+                           trackRates[AXIS_AZ]/1024.0, trackRates[AXIS_ALT]/1024.0);
+                LOGF_DEBUG("Tracking - AZ Now: %.4f TargetNext: %.4f Offset: %.1f steps", 
+                           currentAz, targetAzNext, offsetSteps[AXIS_AZ]);
+
+                // Set the hardware tracking rate
+                trackByRate(AXIS_AZ, static_cast<int32_t>(trackRates[AXIS_AZ]));
+                trackByRate(AXIS_ALT, static_cast<int32_t>(trackRates[AXIS_ALT]));
+
                 break;
             }
+
             break;
 
             default:
@@ -2285,6 +2337,8 @@ void CelestronAUX::TimerHit()
             }
         }
     }
+
+    SetTimer(UpdateRateNP[0].getValue());
 }
 
 /////////////////////////////////////////////////////////////////////////////////////
@@ -2971,6 +3025,7 @@ bool CelestronAUX::SetTrackEnabled(bool enabled)
 {
     if (enabled)
     {
+        m_IsPipelinePrimed = false;
         TrackState = SCOPE_TRACKING;
         resetTracking();
         m_SkyTrackingTarget.rightascension = EqNP[AXIS_RA].getValue();
@@ -3818,4 +3873,46 @@ void CelestronAUX::hex_dump(char *buf, AUXBuffer data, size_t size)
 
     if (size > 0)
         buf[3 * size - 1] = '\0';
+}
+
+void CelestronAUX::guideAltAzDecomposed(double dNS, double dEW, uint32_t ms)
+{
+    // Decompose a celestial N/S/E/W guide pulse into Az/Alt axis components using
+    // the parallactic angle q.  sinQ = sin(q)/cos(alt), cosQ = cos(q)/cos(alt).
+    // The azimuth rate for celestial North is -sin(q)/cos(alt); since sinQ already
+    // carries one 1/cos(alt), dAz_N = -sinQ/cosAlt gives -sin(q)/cos^2(alt), which
+    // is the correct field rotation formula.
+    //
+    // Celestial North in Az/Alt:  dAlt = cos(q),   dAz = -sin(q)/cos(alt)
+    // Celestial East  in Az/Alt:  dAlt = sin(q),   dAz =  cos(q)/cos(alt)
+
+    double H      = rangeHA(get_local_sidereal_time(m_Location.longitude) - m_SkyCurrentRADE.rightascension) * M_PI / 12.0;
+    double dec    = m_SkyCurrentRADE.declination * M_PI / 180.0;
+    double lat    = m_Location.latitude * M_PI / 180.0;
+    double alt    = HorizontalCoordsNP[AXIS_ALT].getValue() * M_PI / 180.0;
+    double cosAlt = std::cos(alt);
+
+    if (std::abs(cosAlt) > 1e-4)
+    {
+        double sinQ = std::sin(H) * std::cos(lat) / cosAlt;
+        double cosQ = (std::sin(lat) - std::sin(dec) * std::sin(alt))
+                      / (std::cos(dec) * cosAlt);
+
+        double dAlt_N =  cosQ;
+        double dAz_N  = -sinQ / cosAlt;
+        double dAlt_E =  sinQ;
+        double dAz_E  =  cosQ / cosAlt;
+
+        double dAz  = dNS * dAz_N + dEW * dAz_E;
+        double dAlt = dNS * dAlt_N + dEW * dAlt_E;
+
+        guidePulsePhysical(AXIS_RA, ms, static_cast<int8_t>(dAz * 100));
+        guidePulsePhysical(AXIS_DE, ms, static_cast<int8_t>(dAlt * 100));
+    }
+    else
+    {
+        // Near zenith: Az is degenerate; fall back to direct axis motion.
+        guidePulsePhysical(AXIS_RA, ms, static_cast<int8_t>(dEW * 100));
+        guidePulsePhysical(AXIS_DE, ms, static_cast<int8_t>(dNS * 100));
+    }
 }
