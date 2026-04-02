@@ -427,6 +427,13 @@ class CelestronAUX :
         // PID controllers
         INDI::PropertyNumber Axis1PIDNP {3};
         INDI::PropertyNumber Axis2PIDNP {3};
+
+        // Sliding Window for Optimized Tracking
+        bool m_IsPipelinePrimed { false };
+        INDI::IHorizontalCoordinates m_TrackingWindowCoords[3];
+        INDI::IEquatorialCoordinates m_LastTrackingTarget { 0, 0 };
+        double m_LastTrackingDt { 0 };
+
         enum
         {
             Propotional,
@@ -460,6 +467,7 @@ class CelestronAUX :
         // Adaptive PID Tuning Toggles
         INDI::PropertySwitch AdaptiveTuningAzSP {2}; // For Azimuth Axis
         INDI::PropertySwitch AdaptiveTuningAlSP {2}; // For Altitude Axis
+        INDI::PropertyNumber UpdateRateNP {1}; // Tracking and polling update rate
 
         typedef enum { ALT_AZ, EQ_FORK, EQ_GEM } MountType;
         MountType m_MountType {ALT_AZ};

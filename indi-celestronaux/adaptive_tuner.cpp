@@ -57,11 +57,15 @@ void AdaptivePIDTuner::setHistorySize(size_t size)
 {
     m_history_size = std::max(static_cast<size_t>(10), size); // Need some minimum history
     m_min_data_for_tuning = std::max(static_cast<size_t>(10), m_history_size / 2); // Update this too
-
     // Trim histories if they are now too long
     while (m_error_history.size() > m_history_size) m_error_history.pop_front();
     while (m_plant_output_history.size() > m_history_size) m_plant_output_history.pop_front();
     while (m_setpoint_history.size() > m_history_size) m_setpoint_history.pop_front();
+}
+
+void AdaptivePIDTuner::setDt(double dt)
+{
+    m_dt = std::max(0.001, dt);
 }
 
 void AdaptivePIDTuner::startActiveTuning()
