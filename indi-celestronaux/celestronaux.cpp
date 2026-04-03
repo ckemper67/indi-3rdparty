@@ -157,8 +157,7 @@ bool CelestronAUX::Handshake()
         }
         else
         {
-            LOG_ERROR("Got no response from target ALT or AZM.");
-            LOG_ERROR("Cannot continue without connection to motor controllers.");
+            LOG_ERROR("Failed to retrieve motor controller versions. Handshake failed.");
             return false;
         }
 
@@ -279,10 +278,10 @@ bool CelestronAUX::initProperties()
     else
         SetApproximateMountAlignment(m_Location.latitude >= 0 ? NORTH_CELESTIAL_POLE : SOUTH_CELESTIAL_POLE);
 
-    //    MountTypeSP[ALT_AZ].fill("ALTAZ", "AltAz", m_MountType == ALT_AZ ? ISS_ON : ISS_OFF);
-    //    MountTypeSP[EQ_FORK].fill("FORK", "EQ Fork", m_MountType == EQ_FORK ? ISS_ON : ISS_OFF);
-    //    MountTypeSP[EQ_GEM].fill("GEM", "EQ GEM", m_MountType == EQ_GEM ? ISS_ON : ISS_OFF);
-    //    MountTypeSP.fill(getDeviceName(), "MOUNT_TYPE", "Mount Type", MAIN_CONTROL_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+    MountTypeSP[ALT_AZ].fill("ALTAZ", "AltAz", m_MountType == ALT_AZ ? ISS_ON : ISS_OFF);
+    MountTypeSP[EQ_FORK].fill("FORK", "EQ Fork", m_MountType == EQ_FORK ? ISS_ON : ISS_OFF);
+    MountTypeSP[EQ_GEM].fill("GEM", "EQ GEM", m_MountType == EQ_GEM ? ISS_ON : ISS_OFF);
+    MountTypeSP.fill(getDeviceName(), "MOUNT_TYPE", "Mount Type", MAIN_CONTROL_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
 
     // Track Modes for Equatorial Mount
     if (m_MountType != ALT_AZ)
@@ -558,7 +557,7 @@ bool CelestronAUX::updateProperties()
     if (isConnected())
     {
         // Main Control Panel
-        //defineProperty(MountTypeSP);
+        defineProperty(MountTypeSP);
         //defineProperty(GainNP);
         if (m_MountType == ALT_AZ)
             defineProperty(HorizontalCoordsNP);
@@ -597,13 +596,15 @@ bool CelestronAUX::updateProperties()
         // Encoders
         defineProperty(EncoderNP);
         defineProperty(AngleNP);
+        // Always define these properties if we're in a simulator mode or if we want to allow runtime switching
+        defineProperty(Axis1PIDNP);
+        defineProperty(Axis2PIDNP);
+        defineProperty(AdaptiveTuningAzSP);
+        defineProperty(AdaptiveTuningAlSP);
+        defineProperty(UpdateRateNP);
         if (m_MountType == ALT_AZ)
         {
-            defineProperty(Axis1PIDNP);
-            defineProperty(Axis2PIDNP);
-            defineProperty(AdaptiveTuningAzSP);
-            defineProperty(AdaptiveTuningAlSP);
-            defineProperty(UpdateRateNP);
+            defineProperty(HorizontalCoordsNP);
         }
 
         getModel(AZM);
@@ -2092,6 +2093,7 @@ void CelestronAUX::TimerHit()
 
                 auto getCoords = [&](double JD, INDI::IHorizontalCoordinates & coords)
                 {
+                    LOG_INFO("Transforming celestial to telescope coordinates...");
                     TelescopeDirectionVector TDV;
                     if (!TransformCelestialToTelescope(m_SkyTrackingTarget.rightascension, m_SkyTrackingTarget.declination, JD - JDnow, TDV))
                     {
@@ -2156,7 +2158,7 @@ void CelestronAUX::TimerHit()
                 double currentAz = EncodersToDegrees(EncoderNP[AXIS_AZ].getValue());
                 double currentAlt = EncodersToDegrees(EncoderNP[AXIS_ALT].getValue());
 
-                // 5. Wallace-style Positioning steering velocities (degrees/sec)
+                // 5. Predictive Positioning steering velocities (degrees/sec)
                 // This velocity closes the entire gap to the next mathematical target in exactly dt seconds.
                 double vSteerAz = range180(targetAzNext - currentAz) / dt;
                 double vSteerAlt = (targetAltNext - currentAlt) / dt;
@@ -2173,8 +2175,8 @@ void CelestronAUX::TimerHit()
                 offsetSteps[AXIS_AZ] = range180(pAz[1] - currentAz) * STEPS_PER_DEGREE;
                 offsetSteps[AXIS_ALT] = (pAlt[1] - currentAlt) * STEPS_PER_DEGREE;
 
-                // Update Tuners
-                if (m_az_pid_tuner && m_MountType == ALT_AZ)
+                // Update Tuners & Apply PID correction ONLY if Enabled
+                if (m_az_pid_tuner && m_MountType == ALT_AZ && AdaptiveTuningAzSP[INDI_ENABLED].s == ISS_ON)
                 {
                     m_az_pid_tuner->processMeasurement(0, -offsetSteps[AXIS_AZ]);
                     if (m_az_pid_tuner->isActivelyTuning())
@@ -2185,8 +2187,9 @@ void CelestronAUX::TimerHit()
                         m_Controllers[AXIS_AZ]->setKi(newKi);
                         m_Controllers[AXIS_AZ]->setKd(newKd);
                     }
+                    trackRates[AXIS_AZ] += m_Controllers[AXIS_AZ]->calculate(0, -offsetSteps[AXIS_AZ]);
                 }
-                if (m_al_pid_tuner && m_MountType == ALT_AZ)
+                if (m_al_pid_tuner && m_MountType == ALT_AZ && AdaptiveTuningAlSP[INDI_ENABLED].s == ISS_ON)
                 {
                     m_al_pid_tuner->processMeasurement(0, -offsetSteps[AXIS_ALT]);
                     if (m_al_pid_tuner->isActivelyTuning())
@@ -2197,14 +2200,10 @@ void CelestronAUX::TimerHit()
                         m_Controllers[AXIS_ALT]->setKi(newKi);
                         m_Controllers[AXIS_ALT]->setKd(newKd);
                     }
+                    trackRates[AXIS_ALT] += m_Controllers[AXIS_ALT]->calculate(0, -offsetSteps[AXIS_ALT]);
                 }
 
-                // Add I/D terms from PID for final polish if needed, 
-                // though vSteer is the dominant "Positioning" command.
-                trackRates[AXIS_AZ] += m_Controllers[AXIS_AZ]->calculate(0, -offsetSteps[AXIS_AZ]);
-                trackRates[AXIS_ALT] += m_Controllers[AXIS_ALT]->calculate(0, -offsetSteps[AXIS_ALT]);
-
-                LOGF_DEBUG("Wallace Steering - AZ Rate: %8.2f (arcsec/s) Alt Rate: %8.2f (arcsec/s)", 
+                LOGF_DEBUG("Predictive Steering - AZ Rate: %8.2f (arcsec/s) Alt Rate: %8.2f (arcsec/s)", 
                            trackRates[AXIS_AZ]/1024.0, trackRates[AXIS_ALT]/1024.0);
                 LOGF_DEBUG("Tracking - AZ Now: %.4f TargetNext: %.4f Offset: %.1f steps", 
                            currentAz, targetAzNext, offsetSteps[AXIS_AZ]);
