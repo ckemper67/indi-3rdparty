@@ -164,7 +164,10 @@ bool CelestronAUX::Handshake()
         LOG_DEBUG("Connection ready. Starting Processing.");
 
         // set mount type to alignment subsystem
-        //SetApproximateMountAlignmentFromMountType(static_cast<MountType>(MountTypeSP.findOnSwitchIndex()));
+        SetApproximateMountAlignmentFromMountType(
+            m_MountType == ALT_AZ ? INDI::AlignmentSubsystem::MathPluginManagement::ALTAZ :
+            INDI::AlignmentSubsystem::MathPluginManagement::EQUATORIAL);
+
         // tell the alignment math plugin to reinitialise
         Initialise(this);
 
@@ -274,9 +277,15 @@ bool CelestronAUX::initProperties()
     }
 
     if (m_MountType == ALT_AZ)
-        SetApproximateMountAlignment(ZENITH);
+    {
+        SetApproximateMountAlignmentFromMountType(INDI::AlignmentSubsystem::MathPluginManagement::ALTAZ);
+        SetParkDataType(PARK_AZ_ALT);
+    }
     else
-        SetApproximateMountAlignment(m_Location.latitude >= 0 ? NORTH_CELESTIAL_POLE : SOUTH_CELESTIAL_POLE);
+    {
+        SetApproximateMountAlignmentFromMountType(INDI::AlignmentSubsystem::MathPluginManagement::EQUATORIAL);
+        SetParkDataType(PARK_HA_DEC);
+    }
 
     MountTypeSP[ALT_AZ].fill("ALTAZ", "AltAz", m_MountType == ALT_AZ ? ISS_ON : ISS_OFF);
     MountTypeSP[EQ_FORK].fill("FORK", "EQ Fork", m_MountType == EQ_FORK ? ISS_ON : ISS_OFF);
@@ -459,6 +468,11 @@ bool CelestronAUX::initProperties()
     FirmwareTP[FW_GPS].fill("GPS version", "", nullptr);
     FirmwareTP.fill(getDeviceName(), "Firmware Info", "Firmware Info", MOUNTINFO_TAB, IP_RO, 0, IPS_IDLE);
 
+    // EQUATORIAL_PE
+    EqPENP[PE_RA].fill("RA", "RA H:M:S", "%10.6m", 0, 24, 0, 0);
+    EqPENP[PE_DEC].fill("DEC", "DEC D:M:S", "%10.6m", -90, 90, 0, 0);
+    EqPENP.fill(getDeviceName(), "EQUATORIAL_PE", "Pointing RA/Dec", MAIN_CONTROL_TAB, IP_RO, 0, IPS_IDLE);
+
     /////////////////////////////////////////////////////////////////////////////////////
     /// Initial Configuration
     /////////////////////////////////////////////////////////////////////////////////////
@@ -592,6 +606,8 @@ bool CelestronAUX::updateProperties()
 
         defineProperty(GPSEmuSP);
         defineProperty(ApproachDirectionSP);
+
+        defineProperty(EqPENP);
 
         // Encoders
         defineProperty(EncoderNP);
@@ -787,7 +803,7 @@ bool CelestronAUX::saveConfigItems(FILE *fp)
     INDI::Telescope::saveConfigItems(fp);
     SaveAlignmentConfigProperties(fp);
 
-    //MountTypeSP.save(fp);
+    MountTypeSP.save(fp);
     PortTypeSP.save(fp);
     CordWrapToggleSP.save(fp);
     CordWrapPositionSP.save(fp);
@@ -997,27 +1013,32 @@ bool CelestronAUX::ISNewSwitch(const char *dev, const char *name, ISState *state
     if (strcmp(dev, getDeviceName()) == 0)
     {
         // mount type
-        //        if (MountTypeSP.isNameMatch(name))
-        //        {
-        //            // Get current type
-        //            MountType currentMountType = static_cast<MountType>(MountTypeSP.findOnSwitchIndex());
+        if (MountTypeSP.isNameMatch(name))
+        {
+            // Get current type
+            MountType currentMountType = m_MountType;
 
-        //            MountTypeSP.update(states, names, n);
-        //            MountTypeSP.setState(IPS_OK);
-        //            MountTypeSP.apply();
+            MountTypeSP.update(states, names, n);
+            MountTypeSP.setState(IPS_OK);
+            MountTypeSP.apply();
 
-        //            // Get target type
-        //            MountType targetMountType = static_cast<MountType>(MountTypeSP.findOnSwitchIndex());
+            // Get target type
+            m_MountType = static_cast<MountType>(MountTypeSP.findOnSwitchIndex());
 
-        //            // If different then update
-        //            if (currentMountType != targetMountType)
-        //            {
-        //                LOG_INFO("Mount type updated. You must restart the driver for changes to take effect.");
-        //                saveConfig(true, MountTypeSP.getName());
-        //            }
+            // If different then update
+            if (currentMountType != m_MountType)
+            {
+                LOG_INFO("Mount type updated.");
+                SetApproximateMountAlignmentFromMountType(
+                    m_MountType == ALT_AZ ? INDI::AlignmentSubsystem::MathPluginManagement::ALTAZ :
+                    INDI::AlignmentSubsystem::MathPluginManagement::EQUATORIAL);
+                SetParkDataType(m_MountType == ALT_AZ ? PARK_AZ_ALT : PARK_HA_DEC);
+                Initialise(this);
+                saveConfig(MountTypeSP);
+            }
 
-        //            return true;
-        //        }
+            return true;
+        }
 
         // Approach Direction
         if (ApproachDirectionSP.isNameMatch(name))
@@ -1203,6 +1224,10 @@ bool CelestronAUX::ISNewSwitch(const char *dev, const char *name, ISState *state
 
         // Process alignment properties
         ProcessAlignmentSwitchProperties(this, name, states, names, n);
+
+        if (strcmp(name, "ALIGNMENT_SUBSYSTEM_MATH_PLUGINS") == 0 ||
+            strcmp(name, "ALIGNMENT_SUBSYSTEM_ACTIVE") == 0)
+            saveConfig();
 
         // Process Focus Properties
         if (strstr(name, "FOCUS_"))
@@ -1391,6 +1416,11 @@ bool CelestronAUX::MoveWE(INDI_DIR_WE dir, TelescopeMotionCommand command)
 /////////////////////////////////////////////////////////////////////////////////////
 IPState CelestronAUX::GuideNorth(uint32_t ms)
 {
+    if (m_MountType == ALT_AZ)
+    {
+        guideAltAzDecomposed(GuideRateNP[AXIS_ALT].getValue(), 0.0, ms);
+        return IPS_BUSY;
+    }
     int8_t rate = static_cast<int8_t>(GuideRateNP[AXIS_ALT].getValue() * 100);
     guidePulse(AXIS_DE, ms, rate);
     return IPS_BUSY;
@@ -1398,6 +1428,11 @@ IPState CelestronAUX::GuideNorth(uint32_t ms)
 
 IPState CelestronAUX::GuideSouth(uint32_t ms)
 {
+    if (m_MountType == ALT_AZ)
+    {
+        guideAltAzDecomposed(-GuideRateNP[AXIS_ALT].getValue(), 0.0, ms);
+        return IPS_BUSY;
+    }
     int8_t rate = static_cast<int8_t>(GuideRateNP[AXIS_ALT].getValue() * 100);
     guidePulse(AXIS_DE, ms, -rate);
     return IPS_BUSY;
@@ -1405,6 +1440,11 @@ IPState CelestronAUX::GuideSouth(uint32_t ms)
 
 IPState CelestronAUX::GuideEast(uint32_t ms)
 {
+    if (m_MountType == ALT_AZ)
+    {
+        guideAltAzDecomposed(0.0, -GuideRateNP[AXIS_AZ].getValue(), ms);
+        return IPS_BUSY;
+    }
     int8_t rate = static_cast<int8_t>(GuideRateNP[AXIS_AZ].getValue() * 100);
     guidePulse(AXIS_RA, ms, -rate);
     return IPS_BUSY;
@@ -1412,6 +1452,11 @@ IPState CelestronAUX::GuideEast(uint32_t ms)
 
 IPState CelestronAUX::GuideWest(uint32_t ms)
 {
+    if (m_MountType == ALT_AZ)
+    {
+        guideAltAzDecomposed(0.0, GuideRateNP[AXIS_AZ].getValue(), ms);
+        return IPS_BUSY;
+    }
     int8_t rate = static_cast<int8_t>(GuideRateNP[AXIS_AZ].getValue() * 100);
     guidePulse(AXIS_RA, ms, rate);
     return IPS_BUSY;
@@ -1420,6 +1465,7 @@ IPState CelestronAUX::GuideWest(uint32_t ms)
 bool CelestronAUX::guidePulse(INDI_EQ_AXIS axis, uint32_t ms, int8_t rate)
 {
     // For Equatorial mounts, use regular guiding.
+    // Also use regular guiding for Alt-Az if we're not in tracking state (unlikely)
     if (m_MountType != ALT_AZ)
     {
         uint8_t ticks = std::min(255u, ms / 10);
@@ -1445,6 +1491,20 @@ bool CelestronAUX::guidePulse(INDI_EQ_AXIS axis, uint32_t ms, int8_t rate)
     }
 
     return true;
+}
+
+bool CelestronAUX::guidePulsePhysical(INDI_EQ_AXIS axis, uint32_t ms, int8_t rate)
+{
+    uint8_t ticks = std::min(255u, ms / 10);
+    AUXBuffer data(2);
+    data[0] = rate;
+    data[1] = ticks;
+    AUXCommand cmd(MC_AUX_GUIDE, APP, axis == AXIS_DE ? ALT : AZM, data);
+    if (axis == AXIS_DE)
+        m_GuideDETimer.start(ticks * 10);
+    else
+        m_GuideRATimer.start(ticks * 10);
+    return sendAUXCommand(cmd);
 }
 /////////////////////////////////////////////////////////////////////////////////////
 ///
@@ -1971,6 +2031,10 @@ bool CelestronAUX::mountToSkyCoords()
             Declination = EquatorialCoordinates.declination;
         }
     }
+
+    EqPENP[PE_RA].setValue(RightAscension);
+    EqPENP[PE_DEC].setValue(Declination);
+    EqPENP.apply();
 
     m_SkyCurrentRADE.rightascension = RightAscension;
     m_SkyCurrentRADE.declination = Declination;
@@ -2961,6 +3025,7 @@ bool CelestronAUX::SetTrackEnabled(bool enabled)
 {
     if (enabled)
     {
+        m_IsPipelinePrimed = false;
         TrackState = SCOPE_TRACKING;
         resetTracking();
         m_SkyTrackingTarget.rightascension = EqNP[AXIS_RA].getValue();
@@ -3808,4 +3873,46 @@ void CelestronAUX::hex_dump(char *buf, AUXBuffer data, size_t size)
 
     if (size > 0)
         buf[3 * size - 1] = '\0';
+}
+
+void CelestronAUX::guideAltAzDecomposed(double dNS, double dEW, uint32_t ms)
+{
+    // Decompose a celestial N/S/E/W guide pulse into Az/Alt axis components using
+    // the parallactic angle q.  sinQ = sin(q)/cos(alt), cosQ = cos(q)/cos(alt).
+    // The azimuth rate for celestial North is -sin(q)/cos(alt); since sinQ already
+    // carries one 1/cos(alt), dAz_N = -sinQ/cosAlt gives -sin(q)/cos^2(alt), which
+    // is the correct field rotation formula.
+    //
+    // Celestial North in Az/Alt:  dAlt = cos(q),   dAz = -sin(q)/cos(alt)
+    // Celestial East  in Az/Alt:  dAlt = sin(q),   dAz =  cos(q)/cos(alt)
+
+    double H      = rangeHA(get_local_sidereal_time(m_Location.longitude) - m_SkyCurrentRADE.rightascension) * M_PI / 12.0;
+    double dec    = m_SkyCurrentRADE.declination * M_PI / 180.0;
+    double lat    = m_Location.latitude * M_PI / 180.0;
+    double alt    = HorizontalCoordsNP[AXIS_ALT].getValue() * M_PI / 180.0;
+    double cosAlt = std::cos(alt);
+
+    if (std::abs(cosAlt) > 1e-4)
+    {
+        double sinQ = std::sin(H) * std::cos(lat) / cosAlt;
+        double cosQ = (std::sin(lat) - std::sin(dec) * std::sin(alt))
+                      / (std::cos(dec) * cosAlt);
+
+        double dAlt_N =  cosQ;
+        double dAz_N  = -sinQ / cosAlt;
+        double dAlt_E =  sinQ;
+        double dAz_E  =  cosQ / cosAlt;
+
+        double dAz  = dNS * dAz_N + dEW * dAz_E;
+        double dAlt = dNS * dAlt_N + dEW * dAlt_E;
+
+        guidePulsePhysical(AXIS_RA, ms, static_cast<int8_t>(dAz * 100));
+        guidePulsePhysical(AXIS_DE, ms, static_cast<int8_t>(dAlt * 100));
+    }
+    else
+    {
+        // Near zenith: Az is degenerate; fall back to direct axis motion.
+        guidePulsePhysical(AXIS_RA, ms, static_cast<int8_t>(dEW * 100));
+        guidePulsePhysical(AXIS_DE, ms, static_cast<int8_t>(dNS * 100));
+    }
 }

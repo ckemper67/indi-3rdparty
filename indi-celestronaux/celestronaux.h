@@ -151,6 +151,13 @@ class CelestronAUX :
         virtual bool MoveWE(INDI_DIR_WE dir, TelescopeMotionCommand command) override;
 
         virtual bool ReadScopeStatus() override;
+
+        /**
+         * @brief Decompose a celestial N/S/E/W guide pulse into Az/Alt axis motion
+         * via the parallactic angle, for ALTAZ mount guiding.
+         */
+        void guideAltAzDecomposed(double dNS, double dEW, uint32_t ms);
+
         virtual void TimerHit() override;
         virtual bool updateLocation(double latitude, double longitude, double elevation) override;
 
@@ -277,6 +284,7 @@ class CelestronAUX :
         /// Guiding
         /////////////////////////////////////////////////////////////////////////////////////
         bool guidePulse(INDI_EQ_AXIS axis, uint32_t ms, int8_t rate);
+        bool guidePulsePhysical(INDI_EQ_AXIS axis, uint32_t ms, int8_t rate);
         bool getGuideRate(AUXTargets target);
         bool setGuideRate(AUXTargets target, uint8_t rate);
 
@@ -297,6 +305,10 @@ class CelestronAUX :
 
         // Actual Sky Equatorial Coordinates
         INDI::IEquatorialCoordinates m_SkyCurrentRADE {0, 0};
+
+        // True pointing position (Wallace errors applied) published as EQUATORIAL_PE
+        INDI::PropertyNumber EqPENP {2};
+        enum { PE_RA = 0, PE_DEC = 1 };
 
         // Current Mount Alt/Az or RA/DE
         INDI::IEquatorialCoordinates m_MountCurrentRADE {0, 0};
