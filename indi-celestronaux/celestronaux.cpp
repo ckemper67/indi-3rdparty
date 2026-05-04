@@ -32,6 +32,8 @@
 #include <thread>
 #include <chrono>
 
+#include <libnova/solar.h>
+#include <libnova/lunar.h>
 #include <alignment/DriverCommon.h>
 #include "celestronaux.h"
 #include "config.h"
@@ -1567,6 +1569,7 @@ void CelestronAUX::resetTracking()
     m_Controllers[AXIS_ALT]->setIntegratorLimits(-10000, 10000);
 
     m_IsPipelinePrimed = false;
+    m_ephemPrimed      = false;
 
     if (m_az_pid_tuner)
     {
@@ -2145,15 +2148,37 @@ void CelestronAUX::TimerHit()
             {
                 break;
             }
-            // We only engage ACTIVE tracking if the mount is Alt-Az.
-            // For Equatorial mount, we simply use user-selected tracking mode and let it passively track.
-            // We only engage ACTIVE tracking if the mount is Alt-Az.
-            // For Equatorial mount, we simply use user-selected tracking mode and let it passively track.
             else if (m_MountType == ALT_AZ)
             {
                 double dt       = UpdateRateNP[0].getValue() / 1000.0;
                 double JDnow    = ln_get_julian_from_sys();
                 double JDoffset = dt / (60 * 60 * 24); // dt seconds in days
+
+                // Step 1: Ephemeris update — nudge tracking target with solar/lunar drift.
+                // Preserves any user-applied offset (e.g. tracking a lunar crater) naturally.
+                int trackMode = TrackModeSP.findOnSwitchIndex();
+                if (trackMode == TRACK_SOLAR || trackMode == TRACK_LUNAR)
+                {
+                    ln_equ_posn epochPos;
+                    if (trackMode == TRACK_SOLAR)
+                        ln_get_solar_equ_coords(JDnow, &epochPos);
+                    else
+                        ln_get_lunar_equ_coords(JDnow, &epochPos);
+
+                    double ephemRA  = epochPos.ra / 15.0;
+                    double ephemDec = epochPos.dec;
+
+                    if (m_ephemPrimed)
+                    {
+                        double deltaRA  = rangeHA(ephemRA - m_lastEphemRA);
+                        double deltaDec = ephemDec - m_lastEphemDec;
+                        m_SkyTrackingTarget.rightascension = range24(m_SkyTrackingTarget.rightascension + deltaRA);
+                        m_SkyTrackingTarget.declination    = rangeDec(m_SkyTrackingTarget.declination + deltaDec);
+                    }
+                    m_lastEphemRA  = ephemRA;
+                    m_lastEphemDec = ephemDec;
+                    m_ephemPrimed  = true;
+                }
 
                 auto getCoords = [&](double JD, INDI::IHorizontalCoordinates & coords)
                 {
@@ -2277,6 +2302,43 @@ void CelestronAUX::TimerHit()
                 trackByRate(AXIS_ALT, static_cast<int32_t>(trackRates[AXIS_ALT]));
 
                 break;
+            }
+            else
+            {
+                // EQ mount: for solar/lunar, compute instantaneous RA/Dec drift rates
+                // from a two-point ephemeris derivative and apply each tick.
+                int trackMode = TrackModeSP.findOnSwitchIndex();
+                if (trackMode == TRACK_SOLAR || trackMode == TRACK_LUNAR)
+                {
+                    double JDnow  = ln_get_julian_from_sys();
+                    double dt     = UpdateRateNP[0].getValue() / 1000.0;
+                    double JDstep = dt / 86400.0;
+
+                    ln_equ_posn pos0, pos1;
+                    if (trackMode == TRACK_SOLAR)
+                    {
+                        ln_get_solar_equ_coords(JDnow,         &pos0);
+                        ln_get_solar_equ_coords(JDnow + JDstep, &pos1);
+                    }
+                    else
+                    {
+                        ln_get_lunar_equ_coords(JDnow,         &pos0);
+                        ln_get_lunar_equ_coords(JDnow + JDstep, &pos1);
+                    }
+
+                    // pos.ra is in degrees; convert delta to arcsec/s
+                    double dRA_arcsec_per_s  = (pos1.ra  - pos0.ra)  * 3600.0 / dt;
+                    double dDec_arcsec_per_s = (pos1.dec - pos0.dec) * 3600.0 / dt;
+
+                    // RA motor rate: sidereal minus the body's eastward RA drift
+                    double raRate  = TRACKRATE_SIDEREAL - dRA_arcsec_per_s;
+                    double decRate = dDec_arcsec_per_s;
+
+                    LOGF_DEBUG("EQ Ephemeris Tracking - RA rate: %.6f Dec rate: %.6f arcsec/s", raRate, decRate);
+
+                    trackByRate(AXIS_AZ,  static_cast<int32_t>(raRate  * 1024));
+                    trackByRate(AXIS_ALT, static_cast<int32_t>(decRate * 1024));
+                }
             }
 
             break;
@@ -3092,17 +3154,8 @@ bool CelestronAUX::SetTrackMode(uint8_t mode)
 
     if (TrackState == SCOPE_TRACKING)
     {
-        if (mode == TRACK_CUSTOM)
-        {
-            double steps[2] = {0, 0};
-            // The rate passed here should be 1024 * angular rate in arsec/s.
-            steps[AXIS_AZ] = m_TrackRates[AXIS_AZ] * 1024;
-            steps[AXIS_ALT] = m_TrackRates[AXIS_ALT] * 1024;
-            trackByRate(AXIS_AZ, steps[AXIS_AZ]);
-            trackByRate(AXIS_ALT, steps[AXIS_ALT]);
-        }
-        else
-            trackByMode(AXIS_AZ, mode);
+        trackByRate(AXIS_AZ,  static_cast<int32_t>(m_TrackRates[AXIS_AZ]  * 1024));
+        trackByRate(AXIS_ALT, static_cast<int32_t>(m_TrackRates[AXIS_ALT] * 1024));
     }
 
     return true;

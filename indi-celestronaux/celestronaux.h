@@ -446,6 +446,11 @@ class CelestronAUX :
         INDI::IEquatorialCoordinates m_LastTrackingTarget { 0, 0 };
         double m_LastTrackingDt { 0 };
 
+        // Ephemeris tracking state (solar/lunar): last sampled JNow RA/Dec
+        double m_lastEphemRA  { 0 };
+        double m_lastEphemDec { 0 };
+        bool   m_ephemPrimed  { false };
+
         enum
         {
             Propotional,
