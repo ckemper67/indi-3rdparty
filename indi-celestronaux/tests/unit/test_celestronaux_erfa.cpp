@@ -552,6 +552,113 @@ TEST_F(ErfaMixinTest, RefractionDisabledIgnoresPressure)
 }
 
 // ---------------------------------------------------------------------------
+// T18 — Ephemeris-off solar: fixed rate has correct sign and magnitude
+// ---------------------------------------------------------------------------
+TEST_F(ErfaMixinTest, EphemerisOffSolarRateMatchesLibnova)
+{
+    const double dt = 600.0;  // 10-minute numerical derivative
+    ln_equ_posn p0, p1;
+    ln_get_solar_equ_coords(JD_TEST, &p0);
+    ln_get_solar_equ_coords(JD_TEST + dt / 86400.0, &p1);
+    double libnova_h_per_s = wrapHA((p1.ra - p0.ra) / 15.0) / dt;
+
+    double fixed_h_per_s = (TRACKRATE_SIDEREAL - TRACKRATE_SOLAR) / 3600.0 / 15.0;
+
+    EXPECT_GT(fixed_h_per_s, 0.0) << "Solar RA drift must be positive";
+    // TRACKRATE_SOLAR is a mean rate; equation of time causes up to ~8% deviation near solstice
+    EXPECT_NEAR(fixed_h_per_s, libnova_h_per_s, std::abs(libnova_h_per_s) * 0.10)
+        << "Fixed solar rate deviates >10% from libnova derivative";
+}
+
+// ---------------------------------------------------------------------------
+// T19 — Ephemeris-off lunar: fixed rate has correct sign and magnitude
+// ---------------------------------------------------------------------------
+TEST_F(ErfaMixinTest, EphemerisOffLunarRateMatchesLibnova)
+{
+    const double dt = 600.0;
+    ln_equ_posn p0, p1;
+    ln_get_lunar_equ_coords(JD_TEST, &p0);
+    ln_get_lunar_equ_coords(JD_TEST + dt / 86400.0, &p1);
+    double libnova_h_per_s = wrapHA((p1.ra - p0.ra) / 15.0) / dt;
+
+    double fixed_h_per_s = (TRACKRATE_SIDEREAL - TRACKRATE_LUNAR) / 3600.0 / 15.0;
+
+    EXPECT_GT(fixed_h_per_s, 0.0) << "Lunar RA drift must be positive";
+    // Lunar rate varies more due to orbital eccentricity; allow 15%
+    EXPECT_NEAR(fixed_h_per_s, libnova_h_per_s, std::abs(libnova_h_per_s) * 0.15)
+        << "Fixed lunar rate deviates >15% from libnova derivative";
+}
+
+// ---------------------------------------------------------------------------
+// T20 — Ephemeris-off solar tracking: 10-minute accumulated RA drift < 30 arcsec
+// ---------------------------------------------------------------------------
+TEST_F(ErfaMixinTest, EphemerisOffSolarTracking10Min)
+{
+    const int    ticks   = 600;
+    const double dt_sec  = 1.0;
+    const double dt_day  = dt_sec / 86400.0;
+    const double raDrift = (TRACKRATE_SIDEREAL - TRACKRATE_SOLAR) / 3600.0 / 15.0;
+
+    ln_equ_posn p0;
+    ln_get_solar_equ_coords(JD_TEST, &p0);
+    double targetRA  = p0.ra / 15.0;
+    double targetDec = p0.dec;   // Dec held fixed — Sun barely moves in Dec near solstice
+
+    double JD = JD_TEST;
+    for (int i = 0; i < ticks; ++i)
+    {
+        JD      += dt_day;
+        targetRA += raDrift * dt_sec;
+        while (targetRA >= 24.0) targetRA -= 24.0;
+        while (targetRA <  0.0)  targetRA += 24.0;
+
+        ln_equ_posn pos;
+        ln_get_solar_equ_coords(JD, &pos);
+
+        double sep = raDecSepArcsec(targetRA, targetDec, pos.ra / 15.0, pos.dec);
+        EXPECT_LT(sep, 30.0)
+            << "Ephemeris-off solar tracking error at tick " << i + 1
+            << ": " << sep << " arcsec";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T21 — Ephemeris-off lunar: fixed rate beats sidereal tracking over 10 minutes
+// ---------------------------------------------------------------------------
+TEST_F(ErfaMixinTest, EphemerisOffLunarBetterThanSidereal)
+{
+    const int    ticks   = 600;
+    const double dt_sec  = 1.0;
+    const double dt_day  = dt_sec / 86400.0;
+    const double raDrift = (TRACKRATE_SIDEREAL - TRACKRATE_LUNAR) / 3600.0 / 15.0;
+
+    ln_equ_posn p0;
+    ln_get_lunar_equ_coords(JD_TEST, &p0);
+    double targetRA = p0.ra / 15.0;
+
+    double JD = JD_TEST;
+    for (int i = 0; i < ticks; ++i)
+    {
+        JD      += dt_day;
+        targetRA += raDrift * dt_sec;
+        while (targetRA >= 24.0) targetRA -= 24.0;
+        while (targetRA <  0.0)  targetRA += 24.0;
+    }
+
+    ln_equ_posn pFinal;
+    ln_get_lunar_equ_coords(JD, &pFinal);
+    double truthRA = pFinal.ra / 15.0;
+
+    // RA-only error for fixed-rate vs. sidereal (RA unchanged from p0)
+    double fixedErrArcsec    = std::abs(wrapHA(targetRA         - truthRA)) * 15.0 * 3600.0;
+    double siderealErrArcsec = std::abs(wrapHA(p0.ra / 15.0     - truthRA)) * 15.0 * 3600.0;
+
+    EXPECT_LT(fixedErrArcsec, siderealErrArcsec)
+        << "Fixed-rate lunar (" << fixedErrArcsec
+        << " arcsec) should beat sidereal (" << siderealErrArcsec << " arcsec)";
+}
+
+// ---------------------------------------------------------------------------
 
 int main(int argc, char **argv)
 {

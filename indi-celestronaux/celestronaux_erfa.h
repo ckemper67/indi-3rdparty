@@ -369,10 +369,9 @@ class CelestronAUXErfa :
         tracking::QuadraticInterpolator m_AltAzWindow;
         tracking::QuadraticInterpolator m_EphemWindow;
 
-        // Ephemeris tracking state: last interpolated RA/Dec for delta accumulation
+        // Last interpolated RA/Dec for delta accumulation; valid when m_EphemWindow.isReady()
         double m_lastEphemRA  { 0 };
         double m_lastEphemDec { 0 };
-        bool   m_ephemPrimed  { false };
 
         INDI::PropertySwitch EphemerisTrackingSP {2};
         enum { EPHEMERIS_TRACKING_OFF = 0, EPHEMERIS_TRACKING_ON = 1 };

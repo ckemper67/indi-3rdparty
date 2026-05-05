@@ -58,6 +58,20 @@ double anglediff(double a, double b)
     return std::abs(d) * ((a - b >= 0 && a - b <= 180) || (a - b <= -180 && a - b >= -360) ? 1 : -1);
 }
 
+// Step size shared by both QuadraticInterpolator windows.
+static constexpr double kWindowStepSec = 30.0;
+
+// RA drift of the sun/moon relative to the sidereal frame, in hours/second.
+// Returns 0 for modes that don't drift (sidereal, custom).
+static double raDriftHoursPerSec(int trackMode)
+{
+    if (trackMode == CelestronAUXErfa::TRACK_SOLAR)
+        return (TRACKRATE_SIDEREAL - TRACKRATE_SOLAR) / 3600.0 / 15.0;
+    if (trackMode == CelestronAUXErfa::TRACK_LUNAR)
+        return (TRACKRATE_SIDEREAL - TRACKRATE_LUNAR) / 3600.0 / 15.0;
+    return 0.0;
+}
+
 /////////////////////////////////////////////////////////////////////////////////////
 ///
 /////////////////////////////////////////////////////////////////////////////////////
@@ -1041,7 +1055,6 @@ bool CelestronAUXErfa::ISNewSwitch(const char *dev, const char *name, ISState *s
             EphemerisTrackingSP.update(states, names, n);
             m_ephemerisTrackingEnabled = (EphemerisTrackingSP[EPHEMERIS_TRACKING_ON].getState() == ISS_ON);
             m_EphemWindow.reset();
-            m_ephemPrimed = false;
             m_AltAzWindow.reset();
             EphemerisTrackingSP.setState(IPS_OK);
             EphemerisTrackingSP.apply();
@@ -1605,7 +1618,6 @@ void CelestronAUXErfa::resetTracking()
 
     m_AltAzWindow.reset();
     m_EphemWindow.reset();
-    m_ephemPrimed = false;
 
     if (m_az_pid_tuner)
     {
@@ -2193,11 +2205,14 @@ void CelestronAUXErfa::TimerHit()
                 double dt    = UpdateRateNP[0].getValue() / 1000.0;
                 double JDnow = currentJD();
 
-                // Step 1: Ephemeris window — smooth parabolic interpolation of solar/lunar position.
+                // Step 1: keep m_SkyTrackingTarget current each tick (cheap).
+                // Ephemeris-on: delta-accumulate from parabolic ephem window (libnova only on advance).
+                // Ephemeris-off: apply fixed rate differential directly.
                 int trackMode = TrackModeSP.findOnSwitchIndex();
                 if (m_ephemerisTrackingEnabled && (trackMode == TRACK_SOLAR || trackMode == TRACK_LUNAR))
                 {
-                    if (!m_EphemWindow.isReady())
+                    bool wasReady = m_EphemWindow.isReady();
+                    if (!wasReady)
                     {
                         auto ephemFn = [trackMode](double JD) -> std::pair<double, double>
                         {
@@ -2208,11 +2223,11 @@ void CelestronAUXErfa::TimerHit()
                                 ln_get_lunar_equ_coords(JD, &pos);
                             return { pos.ra / 15.0, pos.dec };
                         };
-                        m_EphemWindow = tracking::QuadraticInterpolator(ephemFn, 30.0 / 86400.0, JDnow);
+                        m_EphemWindow = tracking::QuadraticInterpolator(ephemFn, kWindowStepSec / 86400.0, JDnow);
                     }
 
                     auto center = m_EphemWindow.valueAt(JDnow);
-                    if (m_ephemPrimed)
+                    if (wasReady)
                     {
                         double deltaRA  = tracking::wrapHA(center.first  - m_lastEphemRA);
                         double deltaDec = center.second - m_lastEphemDec;
@@ -2221,29 +2236,18 @@ void CelestronAUXErfa::TimerHit()
                     }
                     m_lastEphemRA  = center.first;
                     m_lastEphemDec = center.second;
-                    m_ephemPrimed  = true;
                 }
                 else
                 {
-                    // Cheap per-tick drift: keeps m_SkyTrackingTarget current so the
-                    // AltAz SampleFn projects from the correct sky position on each advance().
-                    if (trackMode == TRACK_SOLAR || trackMode == TRACK_LUNAR)
-                    {
-                        double raDrift_h_per_s = (trackMode == TRACK_SOLAR
-                            ? TRACKRATE_SIDEREAL - TRACKRATE_SOLAR
-                            : TRACKRATE_SIDEREAL - TRACKRATE_LUNAR) / 3600.0 / 15.0;
-                        m_SkyTrackingTarget.rightascension =
-                            range24(m_SkyTrackingTarget.rightascension + raDrift_h_per_s * dt);
-                    }
+                    m_SkyTrackingTarget.rightascension =
+                        range24(m_SkyTrackingTarget.rightascension + raDriftHoursPerSec(trackMode) * dt);
                     m_EphemWindow.reset();
-                    m_ephemPrimed = false;
                 }
 
-                // Step 2: AltAz window — fixed 30 s step matching the ephemeris window cadence.
-                // advance() fires every ~30 s (low-freq), keeping ERFA calls out of the
-                // per-tick servo path. SampleFn reads m_SkyTrackingTarget (kept current by
-                // Step 1 above) and calls currentJD() at evaluation time so the forward
-                // projection is always relative to the actual call instant, not prime time.
+                // Step 2: AltAz window — 30 s step so advance() fires at low frequency,
+                // keeping ERFA calls off the per-tick path. currentJD() is called inside
+                // the SampleFn (not captured) so the projection is relative to call time,
+                // not prime time; m_SkyTrackingTarget is already current from Step 1.
                 if (!m_AltAzWindow.isReady())
                 {
                     auto altAzFn = [this, trackMode](double JD) -> std::pair<double, double>
@@ -2252,19 +2256,13 @@ void CelestronAUXErfa::TimerHit()
                         INDI::IEquatorialCoordinates eq { m_SkyTrackingTarget.rightascension,
                                                           m_SkyTrackingTarget.declination };
                         double dtFromNow = (JD - JDcurrent) * 86400.0;
-                        if (m_EphemWindow.isReady())
-                        {
-                            auto rates = m_EphemWindow.rateAt(JDcurrent);
-                            eq.rightascension = range24(eq.rightascension + rates.first  * dtFromNow);
-                            eq.declination    = rangeDec(eq.declination   + rates.second * dtFromNow);
-                        }
-                        else if (trackMode == TRACK_SOLAR || trackMode == TRACK_LUNAR)
-                        {
-                            double raDrift_h_per_s = (trackMode == TRACK_SOLAR
-                                ? TRACKRATE_SIDEREAL - TRACKRATE_SOLAR
-                                : TRACKRATE_SIDEREAL - TRACKRATE_LUNAR) / 3600.0 / 15.0;
-                            eq.rightascension = range24(eq.rightascension + raDrift_h_per_s * dtFromNow);
-                        }
+
+                        auto [raRate, decRate] = m_EphemWindow.isReady()
+                            ? m_EphemWindow.rateAt(JDcurrent)
+                            : std::make_pair(raDriftHoursPerSec(trackMode), 0.0);
+                        eq.rightascension = range24(eq.rightascension + raRate  * dtFromNow);
+                        eq.declination    = rangeDec(eq.declination   + decRate * dtFromNow);
+
                         INDI::IHorizontalCoordinates coords;
                         TelescopeDirectionVector TDV;
                         if (!TransformCelestialToTelescope(eq.rightascension, eq.declination, JD - JDcurrent, TDV))
@@ -2277,7 +2275,7 @@ void CelestronAUXErfa::TimerHit()
                         }
                         return { AzimuthToDegrees(coords.azimuth), coords.altitude };
                     };
-                    m_AltAzWindow = tracking::QuadraticInterpolator(altAzFn, 30.0 / 86400.0, JDnow);
+                    m_AltAzWindow = tracking::QuadraticInterpolator(altAzFn, kWindowStepSec / 86400.0, JDnow);
                     LOG_DEBUG("AltAz tracking window primed.");
                 }
 
@@ -3185,7 +3183,6 @@ bool CelestronAUXErfa::SetTrackMode(uint8_t mode)
     // Reset windows so the next TimerHit reprimes the AltAz SampleFn with the
     // correct trackMode captured in the lambda (avoids stale SOLAR/LUNAR mismatch).
     m_EphemWindow.reset();
-    m_ephemPrimed = false;
     m_AltAzWindow.reset();
 
     if (TrackState == SCOPE_TRACKING)
