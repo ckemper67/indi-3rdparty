@@ -2190,9 +2190,8 @@ void CelestronAUXErfa::TimerHit()
             }
             else if (m_MountType == ALT_AZ)
             {
-                double dt       = UpdateRateNP[0].getValue() / 1000.0;
-                double JDnow    = currentJD();
-                double JDoffset = dt / (60 * 60 * 24); // dt seconds in days
+                double dt    = UpdateRateNP[0].getValue() / 1000.0;
+                double JDnow = currentJD();
 
                 // Step 1: Ephemeris window — smooth parabolic interpolation of solar/lunar position.
                 int trackMode = TrackModeSP.findOnSwitchIndex();
@@ -2226,24 +2225,36 @@ void CelestronAUXErfa::TimerHit()
                 }
                 else
                 {
+                    // Cheap per-tick drift: keeps m_SkyTrackingTarget current so the
+                    // AltAz SampleFn projects from the correct sky position on each advance().
+                    if (trackMode == TRACK_SOLAR || trackMode == TRACK_LUNAR)
+                    {
+                        double raDrift_h_per_s = (trackMode == TRACK_SOLAR
+                            ? TRACKRATE_SIDEREAL - TRACKRATE_SOLAR
+                            : TRACKRATE_SIDEREAL - TRACKRATE_LUNAR) / 3600.0 / 15.0;
+                        m_SkyTrackingTarget.rightascension =
+                            range24(m_SkyTrackingTarget.rightascension + raDrift_h_per_s * dt);
+                    }
                     m_EphemWindow.reset();
                     m_ephemPrimed = false;
                 }
 
-                // Step 2: AltAz window — 3× servo step; SampleFn projects target forward via
-                // ephemeris rate and converts to AltAz using ERFA.
-                double servoStepJD = 3.0 * JDoffset;
-                if (!m_AltAzWindow.isReady() ||
-                    std::abs(m_AltAzWindow.step() - servoStepJD) > 1e-9)
+                // Step 2: AltAz window — fixed 30 s step matching the ephemeris window cadence.
+                // advance() fires every ~30 s (low-freq), keeping ERFA calls out of the
+                // per-tick servo path. SampleFn reads m_SkyTrackingTarget (kept current by
+                // Step 1 above) and calls currentJD() at evaluation time so the forward
+                // projection is always relative to the actual call instant, not prime time.
+                if (!m_AltAzWindow.isReady())
                 {
-                    auto altAzFn = [this, JDnow, trackMode](double JD) -> std::pair<double, double>
+                    auto altAzFn = [this, trackMode](double JD) -> std::pair<double, double>
                     {
+                        double JDcurrent = currentJD();
                         INDI::IEquatorialCoordinates eq { m_SkyTrackingTarget.rightascension,
                                                           m_SkyTrackingTarget.declination };
+                        double dtFromNow = (JD - JDcurrent) * 86400.0;
                         if (m_EphemWindow.isReady())
                         {
-                            auto rates = m_EphemWindow.rateAt(JDnow);
-                            double dtFromNow = (JD - JDnow) * 86400.0;
+                            auto rates = m_EphemWindow.rateAt(JDcurrent);
                             eq.rightascension = range24(eq.rightascension + rates.first  * dtFromNow);
                             eq.declination    = rangeDec(eq.declination   + rates.second * dtFromNow);
                         }
@@ -2252,12 +2263,11 @@ void CelestronAUXErfa::TimerHit()
                             double raDrift_h_per_s = (trackMode == TRACK_SOLAR
                                 ? TRACKRATE_SIDEREAL - TRACKRATE_SOLAR
                                 : TRACKRATE_SIDEREAL - TRACKRATE_LUNAR) / 3600.0 / 15.0;
-                            double dtFromNow = (JD - JDnow) * 86400.0;
                             eq.rightascension = range24(eq.rightascension + raDrift_h_per_s * dtFromNow);
                         }
                         INDI::IHorizontalCoordinates coords;
                         TelescopeDirectionVector TDV;
-                        if (!TransformCelestialToTelescope(eq.rightascension, eq.declination, JD - JDnow, TDV))
+                        if (!TransformCelestialToTelescope(eq.rightascension, eq.declination, JD - JDcurrent, TDV))
                         {
                             erfaEqToHoriz(eq.rightascension, eq.declination, JD, &coords.altitude, &coords.azimuth);
                         }
@@ -2267,7 +2277,7 @@ void CelestronAUXErfa::TimerHit()
                         }
                         return { AzimuthToDegrees(coords.azimuth), coords.altitude };
                     };
-                    m_AltAzWindow = tracking::QuadraticInterpolator(altAzFn, servoStepJD, JDnow);
+                    m_AltAzWindow = tracking::QuadraticInterpolator(altAzFn, 30.0 / 86400.0, JDnow);
                     LOG_DEBUG("AltAz tracking window primed.");
                 }
 
