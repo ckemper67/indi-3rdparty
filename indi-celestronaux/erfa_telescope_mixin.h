@@ -5,7 +5,7 @@
     refraction plan is implemented in the base class.  Delete this file and remove the
     mixin from CelestronAUXErfa's inheritance list when that promotion happens.
 
-    Copyright (C) 2024 Christian Kemper
+    Copyright (C) 2026 Christian Kemper
 
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Lesser General Public

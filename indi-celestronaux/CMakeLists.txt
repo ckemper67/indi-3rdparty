@@ -29,13 +29,13 @@ include_directories( ${EV_INCLUDE_DIR})
 
 include(CMakeCommon)
 
-add_executable(indi_celestron_aux auxproto.cpp celestronaux.cpp adaptive_tuner.cpp)
+add_executable(indi_celestron_aux auxproto.cpp celestronaux.cpp adaptive_tuner.cpp tracking_math.cpp)
 target_link_libraries(indi_celestron_aux ${INDI_LIBRARIES} ${NOVA_LIBRARIES} ${GSL_LIBRARIES})
 install(TARGETS indi_celestron_aux RUNTIME DESTINATION bin)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/indi_celestronaux.xml DESTINATION ${INDI_DATA_DIR})
 
-# ERFA POC driver — requires ERFA, optional so the original target is unaffected
+# ERFA driver — requires ERFA; optional, does not affect the main driver target
 find_package(PkgConfig)
 if(PkgConfig_FOUND)
     pkg_check_modules(ERFA erfa)
@@ -48,6 +48,7 @@ if(ERFA_FOUND)
         erfa_telescope_mixin.cpp
         celestronaux_erfa.cpp
         adaptive_tuner.cpp
+        tracking_math.cpp
     )
     target_include_directories(indi_celestronaux_erfa PRIVATE
         ${CMAKE_CURRENT_BINARY_DIR}
@@ -72,4 +73,57 @@ if(ERFA_FOUND)
             DESTINATION ${INDI_DATA_DIR})
 else()
     message(STATUS "ERFA not found — skipping indi_celestronaux_erfa")
+endif()
+
+# ---------------------------------------------------------------------------
+# Unit tests (optional — requires GTest)
+# ---------------------------------------------------------------------------
+find_package(GTest QUIET)
+if(GTest_FOUND)
+    enable_testing()
+
+    # T1–T5: shared tracking math (no INDI dependency)
+    add_executable(test_celestronaux_tracking
+        tests/unit/test_celestronaux_tracking.cpp
+        tracking_math.cpp
+    )
+    target_include_directories(test_celestronaux_tracking PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${NOVA_INCLUDE_DIR}
+        ${NOVA_INCLUDE_DIR}/..
+    )
+    target_link_libraries(test_celestronaux_tracking
+        GTest::gtest_main
+        ${NOVA_LIBRARIES}
+    )
+    add_test(NAME test_celestronaux_tracking COMMAND test_celestronaux_tracking)
+
+    # T6–T17: ERFA coordinate transformation pipeline (requires INDI + ERFA)
+    if(ERFA_FOUND)
+        add_executable(test_celestronaux_erfa
+            tests/unit/test_celestronaux_erfa.cpp
+            erfa_telescope_mixin.cpp
+            tracking_math.cpp
+        )
+        target_include_directories(test_celestronaux_erfa PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${INDI_INCLUDE_DIR}
+            ${NOVA_INCLUDE_DIR}
+            ${NOVA_INCLUDE_DIR}/..
+            ${GSL_INCLUDE_DIRS}
+            ${ERFA_INCLUDE_DIRS}
+        )
+        target_link_directories(test_celestronaux_erfa PRIVATE ${ERFA_LIBRARY_DIRS})
+        target_link_libraries(test_celestronaux_erfa
+            GTest::gtest_main
+            ${INDI_LIBRARIES}
+            ${NOVA_LIBRARIES}
+            ${ERFA_LIBRARIES}
+            ${GSL_LIBRARIES}
+        )
+        add_test(NAME test_celestronaux_erfa COMMAND test_celestronaux_erfa)
+    endif()
+else()
+    message(STATUS "GTest not found — skipping unit tests")
 endif()
