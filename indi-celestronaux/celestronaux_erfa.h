@@ -374,6 +374,10 @@ class CelestronAUXErfa :
         double m_lastEphemDec { 0 };
         bool   m_ephemPrimed  { false };
 
+        INDI::PropertySwitch EphemerisTrackingSP {2};
+        enum { EPHEMERIS_TRACKING_OFF = 0, EPHEMERIS_TRACKING_ON = 1 };
+        bool m_ephemerisTrackingEnabled { true };
+
         enum
         {
             Propotional,

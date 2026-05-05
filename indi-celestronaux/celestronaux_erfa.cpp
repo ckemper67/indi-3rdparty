@@ -492,6 +492,11 @@ bool CelestronAUXErfa::initProperties()
     // ERFA atmospheric / refraction properties
     initErfaProperties(OPTIONS_TAB);
 
+    EphemerisTrackingSP[EPHEMERIS_TRACKING_OFF].fill("EPHEMERIS_TRACKING_OFF", "Off", ISS_OFF);
+    EphemerisTrackingSP[EPHEMERIS_TRACKING_ON].fill("EPHEMERIS_TRACKING_ON",  "On",  ISS_ON);
+    EphemerisTrackingSP.fill(getDeviceName(), "EPHEMERIS_TRACKING", "Ephemeris Tracking",
+                             OPTIONS_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+
     // set alignment system be on the first time by default
     getSwitch("ALIGNMENT_SUBSYSTEM_ACTIVE")[0].setState(ISS_ON);
 
@@ -614,6 +619,7 @@ bool CelestronAUXErfa::updateProperties()
 
         defineProperty(GPSEmuSP);
         defineProperty(ApproachDirectionSP);
+        defineProperty(EphemerisTrackingSP);
 
         defineProperty(EqPENP);
 
@@ -783,6 +789,7 @@ bool CelestronAUXErfa::updateProperties()
 
         deleteProperty(GPSEmuSP);
         deleteProperty(ApproachDirectionSP);
+        deleteProperty(EphemerisTrackingSP);
 
         deleteProperty(EncoderNP);
         deleteProperty(AngleNP);
@@ -1029,6 +1036,17 @@ bool CelestronAUXErfa::ISNewSwitch(const char *dev, const char *name, ISState *s
         if (handleErfaSwitch(name, states, names, n))
             return true;
 
+        if (EphemerisTrackingSP.isNameMatch(name))
+        {
+            EphemerisTrackingSP.update(states, names, n);
+            m_ephemerisTrackingEnabled = (EphemerisTrackingSP[EPHEMERIS_TRACKING_ON].getState() == ISS_ON);
+            m_EphemWindow.reset();
+            m_ephemPrimed = false;
+            m_AltAzWindow.reset();
+            EphemerisTrackingSP.setState(IPS_OK);
+            EphemerisTrackingSP.apply();
+            return true;
+        }
 
         // mount type
         if (MountTypeSP.isNameMatch(name))
@@ -2178,7 +2196,7 @@ void CelestronAUXErfa::TimerHit()
 
                 // Step 1: Ephemeris window — smooth parabolic interpolation of solar/lunar position.
                 int trackMode = TrackModeSP.findOnSwitchIndex();
-                if (trackMode == TRACK_SOLAR || trackMode == TRACK_LUNAR)
+                if (m_ephemerisTrackingEnabled && (trackMode == TRACK_SOLAR || trackMode == TRACK_LUNAR))
                 {
                     if (!m_EphemWindow.isReady())
                     {
@@ -2218,7 +2236,7 @@ void CelestronAUXErfa::TimerHit()
                 if (!m_AltAzWindow.isReady() ||
                     std::abs(m_AltAzWindow.step() - servoStepJD) > 1e-9)
                 {
-                    auto altAzFn = [this, JDnow](double JD) -> std::pair<double, double>
+                    auto altAzFn = [this, JDnow, trackMode](double JD) -> std::pair<double, double>
                     {
                         INDI::IEquatorialCoordinates eq { m_SkyTrackingTarget.rightascension,
                                                           m_SkyTrackingTarget.declination };
@@ -2228,6 +2246,14 @@ void CelestronAUXErfa::TimerHit()
                             double dtFromNow = (JD - JDnow) * 86400.0;
                             eq.rightascension = range24(eq.rightascension + rates.first  * dtFromNow);
                             eq.declination    = rangeDec(eq.declination   + rates.second * dtFromNow);
+                        }
+                        else if (trackMode == TRACK_SOLAR || trackMode == TRACK_LUNAR)
+                        {
+                            double raDrift_h_per_s = (trackMode == TRACK_SOLAR
+                                ? TRACKRATE_SIDEREAL - TRACKRATE_SOLAR
+                                : TRACKRATE_SIDEREAL - TRACKRATE_LUNAR) / 3600.0 / 15.0;
+                            double dtFromNow = (JD - JDnow) * 86400.0;
+                            eq.rightascension = range24(eq.rightascension + raDrift_h_per_s * dtFromNow);
                         }
                         INDI::IHorizontalCoordinates coords;
                         TelescopeDirectionVector TDV;
@@ -3145,6 +3171,12 @@ bool CelestronAUXErfa::SetTrackMode(uint8_t mode)
         m_TrackRates[AXIS_AZ] = TrackRateNP[AXIS_RA].getValue();
         m_TrackRates[AXIS_ALT] = TrackRateNP[AXIS_DE].getValue();
     }
+
+    // Reset windows so the next TimerHit reprimes the AltAz SampleFn with the
+    // correct trackMode captured in the lambda (avoids stale SOLAR/LUNAR mismatch).
+    m_EphemWindow.reset();
+    m_ephemPrimed = false;
+    m_AltAzWindow.reset();
 
     if (TrackState == SCOPE_TRACKING)
     {
