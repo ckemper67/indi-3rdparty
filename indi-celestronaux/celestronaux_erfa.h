@@ -1,25 +1,25 @@
 /*
-    CelestronAUXErfa — clone of CelestronAUX using ERFA 2000B for all coordinate math.
-
-    This driver is a POC for:
-      - replacing libnova/libastro coordinate calls with direct ERFA 2000B calls
-      - adding ATMOSPHERIC_CONDITIONS + REFRACTION_CONTROL properties
-      - validating the refraction handling design before it is promoted into INDI::Telescope
-
-    When the refraction plan lands in INDI::Telescope:
-      1. ErfaTelescopeMixin contents move into INDI::Telescope
-      2. Remove ErfaTelescopeMixin from this class's inheritance list
-      3. Delete erfa_telescope_mixin.h / .cpp
+    CelestronAUX variant that uses ERFA IAU2006/2000B for coordinate math and adds
+    atmospheric refraction control via the ErfaTelescopeMixin.
 
     Copyright (C) 2020 Paweł T. Jochym
     Copyright (C) 2020 Fabrizio Pollastri
     Copyright (C) 2020-2022 Jasem Mutlaq
-    Copyright (C) 2024 Christian Kemper (ERFA migration)
+    Copyright (C) 2026 Christian Kemper
 
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Lesser General Public
     License as published by the Free Software Foundation; either
     version 2.1 of the License, or (at your option) any later version.
+
+    This library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    Lesser General Public License for more details.
+
+    You should have received a copy of the GNU Lesser General Public
+    License along with this library; if not, write to the Free Software
+    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
 #pragma once
@@ -42,6 +42,7 @@
 #include "auxproto.h"
 #include "adaptive_tuner.h"
 #include "erfa_telescope_mixin.h"
+#include "tracking_math.h"
 
 class CelestronAUXErfa :
     public INDI::Telescope,
@@ -365,12 +366,10 @@ class CelestronAUXErfa :
         INDI::PropertyNumber Axis1PIDNP {3};
         INDI::PropertyNumber Axis2PIDNP {3};
 
-        bool m_IsPipelinePrimed { false };
-        INDI::IHorizontalCoordinates m_TrackingWindowCoords[3];
-        INDI::IEquatorialCoordinates m_LastTrackingTarget { 0, 0 };
-        double m_LastTrackingDt { 0 };
+        tracking::QuadraticInterpolator m_AltAzWindow;
+        tracking::QuadraticInterpolator m_EphemWindow;
 
-        // Ephemeris tracking state (solar/lunar): last sampled JNow RA/Dec
+        // Ephemeris tracking state: last interpolated RA/Dec for delta accumulation
         double m_lastEphemRA  { 0 };
         double m_lastEphemDec { 0 };
         bool   m_ephemPrimed  { false };

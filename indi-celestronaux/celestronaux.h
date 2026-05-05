@@ -41,6 +41,7 @@
 
 #include "auxproto.h"
 #include "adaptive_tuner.h"
+#include "tracking_math.h"
 
 class CelestronAUX :
     public INDI::Telescope,
@@ -440,13 +441,10 @@ class CelestronAUX :
         INDI::PropertyNumber Axis1PIDNP {3};
         INDI::PropertyNumber Axis2PIDNP {3};
 
-        // Sliding Window for Optimized Tracking
-        bool m_IsPipelinePrimed { false };
-        INDI::IHorizontalCoordinates m_TrackingWindowCoords[3];
-        INDI::IEquatorialCoordinates m_LastTrackingTarget { 0, 0 };
-        double m_LastTrackingDt { 0 };
+        tracking::QuadraticInterpolator m_AltAzWindow;
+        tracking::QuadraticInterpolator m_EphemWindow;
 
-        // Ephemeris tracking state (solar/lunar): last sampled JNow RA/Dec
+        // Ephemeris tracking state: last interpolated RA/Dec for delta accumulation
         double m_lastEphemRA  { 0 };
         double m_lastEphemDec { 0 };
         bool   m_ephemPrimed  { false };

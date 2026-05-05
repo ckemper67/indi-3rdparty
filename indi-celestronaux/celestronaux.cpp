@@ -36,6 +36,7 @@
 #include <libnova/lunar.h>
 #include <alignment/DriverCommon.h>
 #include "celestronaux.h"
+#include "tracking_math.h"
 #include "config.h"
 
 #define DEBUG_PID
@@ -1568,8 +1569,9 @@ void CelestronAUX::resetTracking()
                                           Axis2PIDNP[Derivative].getValue(), Axis2PIDNP[Integral].getValue()));
     m_Controllers[AXIS_ALT]->setIntegratorLimits(-10000, 10000);
 
-    m_IsPipelinePrimed = false;
-    m_ephemPrimed      = false;
+    m_AltAzWindow.reset();
+    m_EphemWindow.reset();
+    m_ephemPrimed = false;
 
     if (m_az_pid_tuner)
     {
@@ -2154,115 +2156,98 @@ void CelestronAUX::TimerHit()
                 double JDnow    = ln_get_julian_from_sys();
                 double JDoffset = dt / (60 * 60 * 24); // dt seconds in days
 
-                // Step 1: Ephemeris update — nudge tracking target with solar/lunar drift.
-                // Preserves any user-applied offset (e.g. tracking a lunar crater) naturally.
+                // Step 1: Ephemeris window — smooth parabolic interpolation of solar/lunar position.
+                // valueAt(JDnow) gives the interpolated RA/Dec; the delta is applied to the
+                // tracking target so any user offset (e.g. a lunar crater) is preserved.
                 int trackMode = TrackModeSP.findOnSwitchIndex();
                 if (trackMode == TRACK_SOLAR || trackMode == TRACK_LUNAR)
                 {
-                    ln_equ_posn epochPos;
-                    if (trackMode == TRACK_SOLAR)
-                        ln_get_solar_equ_coords(JDnow, &epochPos);
-                    else
-                        ln_get_lunar_equ_coords(JDnow, &epochPos);
+                    if (!m_EphemWindow.isReady())
+                    {
+                        auto ephemFn = [trackMode](double JD) -> std::pair<double, double>
+                        {
+                            ln_equ_posn pos;
+                            if (trackMode == TRACK_SOLAR)
+                                ln_get_solar_equ_coords(JD, &pos);
+                            else
+                                ln_get_lunar_equ_coords(JD, &pos);
+                            return { pos.ra / 15.0, pos.dec };
+                        };
+                        m_EphemWindow = tracking::QuadraticInterpolator(ephemFn, 30.0 / 86400.0, JDnow);
+                    }
 
-                    double ephemRA  = epochPos.ra / 15.0;
-                    double ephemDec = epochPos.dec;
-
+                    auto center = m_EphemWindow.valueAt(JDnow);
                     if (m_ephemPrimed)
                     {
-                        double deltaRA  = rangeHA(ephemRA - m_lastEphemRA);
-                        double deltaDec = ephemDec - m_lastEphemDec;
+                        double deltaRA  = tracking::wrapHA(center.first  - m_lastEphemRA);
+                        double deltaDec = center.second - m_lastEphemDec;
                         m_SkyTrackingTarget.rightascension = range24(m_SkyTrackingTarget.rightascension + deltaRA);
                         m_SkyTrackingTarget.declination    = rangeDec(m_SkyTrackingTarget.declination + deltaDec);
                     }
-                    m_lastEphemRA  = ephemRA;
-                    m_lastEphemDec = ephemDec;
+                    m_lastEphemRA  = center.first;
+                    m_lastEphemDec = center.second;
                     m_ephemPrimed  = true;
-                }
-
-                auto getCoords = [&](double JD, INDI::IHorizontalCoordinates & coords)
-                {
-                    LOG_INFO("Transforming celestial to telescope coordinates...");
-                    TelescopeDirectionVector TDV;
-                    if (!TransformCelestialToTelescope(m_SkyTrackingTarget.rightascension, m_SkyTrackingTarget.declination, JD - JDnow, TDV))
-                    {
-                        INDI::IEquatorialCoordinates Equat = { m_SkyTrackingTarget.rightascension, m_SkyTrackingTarget.declination };
-                        INDI::EquatorialToHorizontal(&Equat, &m_Location, JD, &coords);
-                    }
-                    else
-                    {
-                        AltitudeAzimuthFromTelescopeDirectionVector(TDV, coords);
-                    }
-                };
-
-                // Invalidation Check: Prime the pipeline if needed
-                if (!m_IsPipelinePrimed || 
-                    std::abs(m_LastTrackingTarget.rightascension - m_SkyTrackingTarget.rightascension) > 1e-6 ||
-                    std::abs(m_LastTrackingTarget.declination - m_SkyTrackingTarget.declination) > 1e-6 ||
-                    std::abs(m_LastTrackingDt - dt) > 1e-6)
-                {
-                    getCoords(JDnow - JDoffset, m_TrackingWindowCoords[0]);
-                    getCoords(JDnow, m_TrackingWindowCoords[1]);
-                    getCoords(JDnow + JDoffset, m_TrackingWindowCoords[2]);
-                    
-                    m_IsPipelinePrimed = true;
-                    m_LastTrackingTarget = m_SkyTrackingTarget;
-                    m_LastTrackingDt = dt;
-                    LOG_DEBUG("Tracking pipeline primed with 3 points.");
                 }
                 else
                 {
-                    // Sliding Window Update: Only 1 new call per tick
-                    m_TrackingWindowCoords[0] = m_TrackingWindowCoords[1];
-                    m_TrackingWindowCoords[1] = m_TrackingWindowCoords[2];
-                    getCoords(JDnow + JDoffset, m_TrackingWindowCoords[2]);
+                    m_EphemWindow.reset();
+                    m_ephemPrimed = false;
                 }
 
-                // 2. Parabolic coefficients: P(t) = at^2 + bt + c, where t=0 is JDnow
-                // t is in units of dt. Points are at t=-1, t=0, t=1
-                double pAz[3] = { AzimuthToDegrees(m_TrackingWindowCoords[0].azimuth),
-                                  AzimuthToDegrees(m_TrackingWindowCoords[1].azimuth),
-                                  AzimuthToDegrees(m_TrackingWindowCoords[2].azimuth) };
-                double pAlt[3] = { m_TrackingWindowCoords[0].altitude, 
-                                   m_TrackingWindowCoords[1].altitude, 
-                                   m_TrackingWindowCoords[2].altitude };
+                // Step 2: AltAz window — 3× servo step so JDnow falls between samples and the
+                // parabola fires. SampleFn projects the tracking target forward via the ephemeris
+                // rate before converting to AltAz, so drift is captured in the window geometry.
+                double servoStepJD = 3.0 * JDoffset;
+                if (!m_AltAzWindow.isReady() ||
+                    std::abs(m_AltAzWindow.step() - servoStepJD) > 1e-9)
+                {
+                    auto altAzFn = [this, JDnow](double JD) -> std::pair<double, double>
+                    {
+                        INDI::IEquatorialCoordinates eq { m_SkyTrackingTarget.rightascension,
+                                                          m_SkyTrackingTarget.declination };
+                        if (m_EphemWindow.isReady())
+                        {
+                            auto rates = m_EphemWindow.rateAt(JDnow);
+                            double dtFromNow = (JD - JDnow) * 86400.0;
+                            eq.rightascension = range24(eq.rightascension + rates.first  * dtFromNow);
+                            eq.declination    = rangeDec(eq.declination   + rates.second * dtFromNow);
+                        }
+                        INDI::IHorizontalCoordinates coords;
+                        TelescopeDirectionVector TDV;
+                        if (!TransformCelestialToTelescope(eq.rightascension, eq.declination, JD - JDnow, TDV))
+                        {
+                            INDI::EquatorialToHorizontal(&eq, &m_Location, JD, &coords);
+                        }
+                        else
+                        {
+                            AltitudeAzimuthFromTelescopeDirectionVector(TDV, coords);
+                        }
+                        return { AzimuthToDegrees(coords.azimuth), coords.altitude };
+                    };
+                    m_AltAzWindow = tracking::QuadraticInterpolator(altAzFn, servoStepJD, JDnow);
+                    LOG_DEBUG("AltAz tracking window primed.");
+                }
 
-                // Azimuth wrapping handling for interpolation
-                pAz[0] = pAz[1] + range180(pAz[0] - pAz[1]);
-                pAz[2] = pAz[1] + range180(pAz[2] - pAz[1]);
+                // Parabolic feedforward rate + proportional error correction from encoder position.
+                auto [vAz, vAlt]         = m_AltAzWindow.rateAt(JDnow);
+                auto [azTarget, altTarget] = m_AltAzWindow.valueAt(JDnow);
 
-                // coefficients for Azimuth: a = (P1 + P(-1) - 2P0)/2, b = (P1 - P(-1))/2, c = P0
-                double az_a = (pAz[2] + pAz[0] - 2 * pAz[1]) / 2.0;
-                double az_b = (pAz[2] - pAz[0]) / 2.0;
-
-                // coefficients for Altitude
-                double alt_a = (pAlt[2] + pAlt[0] - 2 * pAlt[1]) / 2.0;
-                double alt_b = (pAlt[2] - pAlt[0]) / 2.0;
-
-                // 3. Predicted Target Position at the end of the next interval (T + dt)
-                double targetAzNext = az_a * dt * dt + az_b * dt + pAz[1];
-                double targetAltNext = alt_a * dt * dt + alt_b * dt + pAlt[1];
-
-                // 4. Current ground truth from encoders
-                double currentAz = EncodersToDegrees(EncoderNP[AXIS_AZ].getValue());
+                double currentAz  = EncodersToDegrees(EncoderNP[AXIS_AZ].getValue());
                 double currentAlt = EncodersToDegrees(EncoderNP[AXIS_ALT].getValue());
-
-                // 5. Predictive Positioning steering velocities (degrees/sec)
-                // This velocity closes the entire gap to the next mathematical target in exactly dt seconds.
-                double vSteerAz = range180(targetAzNext - currentAz) / dt;
-                double vSteerAlt = (targetAltNext - currentAlt) / dt;
+                double vSteerAz   = vAz  + tracking::wrapAngle(azTarget - currentAz)  / dt;
+                double vSteerAlt  = vAlt + (altTarget - currentAlt) / dt;
 
                 // 6. Convert to Celestron units (1024 * arcsec/s)
                 double trackRates[2];
-                trackRates[AXIS_AZ] = vSteerAz * 3600.0 * 1024.0;
+                trackRates[AXIS_AZ]  = vSteerAz  * 3600.0 * 1024.0;
                 trackRates[AXIS_ALT] = vSteerAlt * 3600.0 * 1024.0;
 
                 // 7. Adaptive PID Tuning & Servo Feedback
                 // The steering velocity already acts as a Proportional controller (Kp = 1/dt).
                 // We use the Adaptive PID tuner to "mop up" any secondary oscillations or model residuals.
                 double offsetSteps[2];
-                offsetSteps[AXIS_AZ] = range180(pAz[1] - currentAz) * STEPS_PER_DEGREE;
-                offsetSteps[AXIS_ALT] = (pAlt[1] - currentAlt) * STEPS_PER_DEGREE;
+                offsetSteps[AXIS_AZ]  = range180(azTarget - currentAz)  * STEPS_PER_DEGREE;
+                offsetSteps[AXIS_ALT] = (altTarget - currentAlt) * STEPS_PER_DEGREE;
 
                 // Update Tuners & Apply PID correction ONLY if Enabled
                 if (m_az_pid_tuner && m_MountType == ALT_AZ && AdaptiveTuningAzSP[INDI_ENABLED].s == ISS_ON)
@@ -2292,10 +2277,10 @@ void CelestronAUX::TimerHit()
                     trackRates[AXIS_ALT] += m_Controllers[AXIS_ALT]->calculate(0, -offsetSteps[AXIS_ALT]);
                 }
 
-                LOGF_DEBUG("Predictive Steering - AZ Rate: %8.2f (arcsec/s) Alt Rate: %8.2f (arcsec/s)", 
+                LOGF_DEBUG("Predictive Steering - AZ Rate: %8.2f (arcsec/s) Alt Rate: %8.2f (arcsec/s)",
                            trackRates[AXIS_AZ]/1024.0, trackRates[AXIS_ALT]/1024.0);
-                LOGF_DEBUG("Tracking - AZ Now: %.4f TargetNext: %.4f Offset: %.1f steps", 
-                           currentAz, targetAzNext, offsetSteps[AXIS_AZ]);
+                LOGF_DEBUG("Tracking - AZ Now: %.4f Target: %.4f Offset: %.1f steps",
+                           currentAz, azTarget, offsetSteps[AXIS_AZ]);
 
                 // Set the hardware tracking rate
                 trackByRate(AXIS_AZ, static_cast<int32_t>(trackRates[AXIS_AZ]));
@@ -2317,25 +2302,18 @@ void CelestronAUX::TimerHit()
                     ln_equ_posn pos0, pos1;
                     if (trackMode == TRACK_SOLAR)
                     {
-                        ln_get_solar_equ_coords(JDnow,         &pos0);
+                        ln_get_solar_equ_coords(JDnow,          &pos0);
                         ln_get_solar_equ_coords(JDnow + JDstep, &pos1);
                     }
                     else
                     {
-                        ln_get_lunar_equ_coords(JDnow,         &pos0);
+                        ln_get_lunar_equ_coords(JDnow,          &pos0);
                         ln_get_lunar_equ_coords(JDnow + JDstep, &pos1);
                     }
 
-                    // pos.ra is in degrees; convert delta to arcsec/s
-                    double dRA_arcsec_per_s  = (pos1.ra  - pos0.ra)  * 3600.0 / dt;
-                    double dDec_arcsec_per_s = (pos1.dec - pos0.dec) * 3600.0 / dt;
-
-                    // RA motor rate: sidereal minus the body's eastward RA drift
-                    double raRate  = TRACKRATE_SIDEREAL - dRA_arcsec_per_s;
-                    double decRate = dDec_arcsec_per_s;
-
+                    double raRate, decRate;
+                    tracking::computeEqTrackRates(pos0.ra, pos0.dec, pos1.ra, pos1.dec, dt, &raRate, &decRate);
                     LOGF_DEBUG("EQ Ephemeris Tracking - RA rate: %.6f Dec rate: %.6f arcsec/s", raRate, decRate);
-
                     trackByRate(AXIS_AZ,  static_cast<int32_t>(raRate  * 1024));
                     trackByRate(AXIS_ALT, static_cast<int32_t>(decRate * 1024));
                 }
@@ -3087,7 +3065,8 @@ bool CelestronAUX::SetTrackEnabled(bool enabled)
 {
     if (enabled)
     {
-        m_IsPipelinePrimed = false;
+        m_AltAzWindow.reset();
+        m_EphemWindow.reset();
         TrackState = SCOPE_TRACKING;
         resetTracking();
         m_SkyTrackingTarget.rightascension = EqNP[AXIS_RA].getValue();
